@@ -1,6 +1,6 @@
 <h1 align="center">pv-ca/skills</h1>
 
-<p align="center"><strong>Agent skills that come with their tests.</strong> Each one has a real example of what it produces and cases you can run to see that it still works.</p>
+<p align="center">Skills I made and use every day. Take what helps you.</p>
 
 <p align="center"><a href="LICENSE"><img src="https://img.shields.io/github/license/pv-ca/skills?style=flat" alt="License"></a> <a href="https://github.com/pv-ca/skills/actions/workflows/check.yml"><img src="https://github.com/pv-ca/skills/actions/workflows/check.yml/badge.svg" alt="check"></a></p>
 
