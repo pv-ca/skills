@@ -11,8 +11,6 @@ description: >-
   local repository edits, local media processing (ffmpeg, ImageMagick, Pillow), shell work, questions the
   user wants Claude to answer itself, sensitive data or personal photos/IDs, google-genai SDK code, or
   Gemini Tasks.
-metadata:
-  status: stable
 ---
 
 # Gemini web

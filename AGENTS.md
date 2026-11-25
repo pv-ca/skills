@@ -6,17 +6,16 @@ Rules for adding or changing a skill. `scripts/check.py` enforces every rule mar
 
 One folder per skill, flat: `skills/<name>/`. The folder name equals the frontmatter `name` (checked). Names are unique (checked).
 
-A skill's status lives in its frontmatter, not in its path, so changing status never breaks a link:
+Every skill is published unless it is a draft. A published skill needs no `metadata`. A draft marks itself in the frontmatter, not in its path, so publishing it never breaks a link:
 
 ```yaml
 metadata:
-  status: stable        # stable | in-progress | deprecated (checked)
-  internal: true        # required unless stable (checked); hides it from `npx skills add`
+  internal: true        # drafts only; hides the skill from `npx skills add`
 ```
 
-`metadata.internal` is how the `skills` CLI hides a skill (see [ADR 0001](.agents/adr/0001-skills-cli-not-plugin.md) for the test). Forgetting it ships a draft, which is why it is checked.
+`metadata.internal` is how the `skills` CLI hides a skill (see [ADR 0001](.agents/adr/0001-skills-cli-not-plugin.md) for the test; [ADR 0002](.agents/adr/0002-no-status-field.md) for why there is no status field). A skill without it is held to everything below, so a forgotten draft fails the check unless it is already complete.
 
-## A stable skill has
+## A published skill has
 
 - `SKILL.md`, under 500 lines (checked). Detail the agent reads only sometimes goes in files beside it.
 - `README.md` with the sections `## What it does`, `## When to reach for it`, `## It's working if` (checked), plus an `## Example` that quotes `example.md`.
@@ -25,7 +24,7 @@ metadata:
 - `agents/openai.yaml` with `interface.display_name` and `interface.short_description`, for the Codex picker (checked).
 - A link from the top-level `README.md` as `skills/<name>/` (checked), under a heading that says what kind of work it serves.
 
-A draft or deprecated skill needs only `SKILL.md`, and must not be linked from the top-level `README.md` (checked).
+A draft needs only `SKILL.md`, and must not be linked from the top-level `README.md` (checked).
 
 ## Writing a skill
 
@@ -44,10 +43,10 @@ A draft or deprecated skill needs only `SKILL.md`, and must not be linked from t
 4. If the output changed in a way a user would see, regenerate `example.md` from a real run.
 5. Add a line under `## Unreleased` in `CHANGELOG.md`, with the eval result.
 
-## Status changes
+## Publishing and retiring
 
-- Promote (`in-progress` to `stable`): remove `internal`, add the files a stable skill has, link it from the README.
-- Retire (to `deprecated`): add `internal: true`, remove its README link, say in its own `README.md` what replaces it.
+- Publish a draft: remove `metadata`, add the files a published skill has, link it from the README.
+- Retire: delete the folder and its README link, and say in `CHANGELOG.md` what replaces it. Git keeps the history.
 
 ## Releases
 
@@ -55,4 +54,4 @@ A release moves the `## Unreleased` lines under a version heading and tags `vX.Y
 
 ## Local install
 
-`scripts/link-skills.sh` links every non-deprecated skill into `~/.claude/skills/` (or `$CLAUDE_SKILLS_DIR`). It refuses to replace anything that is not already a link into this repository.
+`scripts/link-skills.sh` links every skill, drafts included, into `~/.claude/skills/` (or `$CLAUDE_SKILLS_DIR`). It refuses to replace anything that is not already a link into this repository.

@@ -1,6 +1,6 @@
 # Install through the `skills` CLI, not a plugin
 
-Date: 2026-11-15. Status: accepted.
+Date: 2026-11-15. Status: accepted; the status field was dropped by [ADR 0002](0002-no-status-field.md).
 
 ## Context
 

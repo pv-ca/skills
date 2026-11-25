@@ -12,8 +12,6 @@ description: >
   the bar on this task", "rewrite my prompt like a pro would ask it". NOT FOR:
   expanding scope, adding features, or general prompt polishing for tone or
   length.
-metadata:
-  status: stable
 ---
 
 # Expert

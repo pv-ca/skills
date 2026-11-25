@@ -5,7 +5,6 @@ import re
 import sys
 from pathlib import Path
 
-STATUSES = {"stable", "in-progress", "deprecated"}
 DOC_SECTIONS = ("## What it does", "## When to reach for it", "## It's working if")
 TEXT_SUFFIXES = {".md", ".json", ".py", ".sh", ".yml", ".yaml", ".txt"}
 SKIP_DIRS = {".git", ".eval-runs", "__pycache__", "node_modules"}  # generated or ignored, not repo prose
@@ -55,17 +54,14 @@ def check(root):
             errors.append(f"{where}: no description")
         if len(text.splitlines()) >= 500:
             errors.append(f"{where}: SKILL.md has 500 lines or more")
-        status = meta.get("status", "")
         internal = meta.get("internal", "").lower() in ("true", "1")
-        if status not in STATUSES:
-            errors.append(f"{where}: metadata.status must be one of {sorted(STATUSES)}, got '{status}'")
-            continue
         linked = f"skills/{folder.name}/" in readme
-        if status == "stable":
-            if internal:
-                errors.append(f"{where}: a stable skill must not be internal")
+        if internal:
+            if linked:
+                errors.append(f"{where}: an internal skill must not be linked from README.md")
+        else:
             if not linked:
-                errors.append(f"{where}: stable skill not linked from README.md as skills/{folder.name}/")
+                errors.append(f"{where}: published skill not linked from README.md as skills/{folder.name}/")
             yaml_path = folder / "agents" / "openai.yaml"
             yaml_text = yaml_path.read_text(encoding="utf-8") if yaml_path.exists() else ""
             for key in ("display_name", "short_description"):
@@ -77,11 +73,6 @@ def check(root):
                 if section not in doc_text:
                     errors.append(f"{where}: README.md lacks '{section}'")
             errors += check_evals(folder, where)
-        else:
-            if not internal:
-                errors.append(f"{where}: a {status} skill needs metadata.internal: true")
-            if linked:
-                errors.append(f"{where}: a {status} skill must not be linked from README.md")
     for name, places in names.items():
         if len(places) > 1:
             errors.append(f"skill name '{name}' used more than once: {places}")
