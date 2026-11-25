@@ -16,3 +16,5 @@ jobs:
         run: python3 scripts/check.py
       - name: Tests of the rules
         run: python3 -m unittest discover -s tests -v
+      - name: Skill selftests
+        run: python3 skills/gemini-web/scripts/gemini_web.py --selftest

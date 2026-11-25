@@ -10,6 +10,7 @@ called and no file is edited; a `silent` case passes when it is not called. The 
 as result.md next to the case's `judge` text, for a person to judge the quality.
 """
 import argparse
+import base64
 import json
 import os
 import re
@@ -38,6 +39,32 @@ def install_copy(skill_dir, work, alias):
 
 def alias_message(message, skill, alias):
     return re.sub(rf"(^|\s)/{re.escape(skill)}(?=$|\s|[.,;:!?])", rf"\1/{alias}", message)
+
+
+def seed_files(work, files):
+    """Create optional per-case fixture files under work. Values prefixed with 'base64:' are decoded as bytes."""
+    root = Path(work).resolve()
+    for rel, content in (files or {}).items():
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            raise ValueError(f"invalid fixture path: {rel}")
+        dest = (root / rel_path).resolve()
+        if root not in dest.parents:
+            raise ValueError(f"fixture path escapes work dir: {rel}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, str) and content.startswith("base64:"):
+            dest.write_bytes(base64.b64decode(content[len("base64:"):]))
+        else:
+            dest.write_text(str(content), encoding="utf-8")
+
+
+def case_env(base_env, suite_env=None, per_case_env=None):
+    """Merge optional suite-level and case-level environment variables onto base_env."""
+    env = dict(base_env)
+    for extra in (suite_env, per_case_env):
+        if isinstance(extra, dict):
+            env.update({str(k): str(v) for k, v in extra.items()})
+    return env
 
 
 def snapshot(work):
@@ -83,7 +110,7 @@ def verdict(case, alias, skills, edits, result, is_error, returncode=0):
         return "ERROR"
     called = alias in skills
     if case["expect"] == "fires":
-        return "pass" if called and edits == 0 else "FAIL"
+        return "pass" if called and (edits == 0 or bool(case.get("allow_edits"))) else "FAIL"
     return "pass" if not called else "FAIL"
 
 
@@ -91,12 +118,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("skill")
     ap.add_argument("--model", default="sonnet")
+    ap.add_argument("--effort")
     ap.add_argument("--case")
     ap.add_argument("--out", default=str(ROOT / ".eval-runs"))
     args = ap.parse_args()
 
     skill_dir = ROOT / "skills" / args.skill
-    cases = json.loads((skill_dir / "evals.json").read_text(encoding="utf-8"))["cases"]
+    suite = json.loads((skill_dir / "evals.json").read_text(encoding="utf-8"))
+    cases = suite["cases"]
+    suite_env = suite.get("env")
     if args.case:
         cases = [c for c in cases if c["id"] == args.case]
         if not cases:
@@ -104,18 +134,21 @@ def main():
     alias = f"{args.skill}-eval"
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    env = {k: v for k, v in os.environ.items() if k not in NESTING_VARS}
+    base_env = {k: v for k, v in os.environ.items() if k not in NESTING_VARS}
 
     failed = 0
     for case in cases:
         work = Path(tempfile.mkdtemp(prefix=f"{args.skill}-{case['id']}-", dir=out))
         install_copy(skill_dir, work, alias)
+        seed_files(work, case.get("files"))
         message = alias_message(case["message"], args.skill, alias)
+        env = case_env(base_env, suite_env, case.get("env"))
         before = snapshot(work)
-        proc = subprocess.run(
-            ["claude", "-p", "--model", args.model, "--output-format", "stream-json", "--verbose", message],
-            cwd=work, env=env, capture_output=True, text=True,
-        )
+        cmd = ["claude", "-p", "--model", args.model, "--setting-sources", "project", "--output-format", "stream-json", "--verbose"]
+        if args.effort:
+            cmd += ["--effort", args.effort]
+        cmd.append(message)
+        proc = subprocess.run(cmd, cwd=work, env=env, capture_output=True, text=True)
         raw = proc.stdout + proc.stderr
         (work / "run.jsonl").write_text(raw, encoding="utf-8")
         skills, edits, result, is_error = parse(raw, alias, message)

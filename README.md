@@ -7,6 +7,7 @@ They're small on purpose. Read one, change what doesn't fit you, make it yours.
 ## The skills
 
 - **[expert](skills/expert/)**: put `/expert` at the end of a task and you get it back the way someone really good at that job would ask for it. Deeper, not bigger. ([see an example](skills/expert/example.md))
+- **[gemini-web](skills/gemini-web/)**: consult your own logged-in Gemini web session from your coding agent (text, clean files, images, short videos, and Deep Research) on a separate quota, with offline guards and temporary chats by default. ([see an example](skills/gemini-web/example.md))
 
 Each skill comes with a real output I didn't touch, and a few tests I run before changing it.
 

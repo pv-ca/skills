@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-from eval import alias_message, install_copy, parse, verdict  # noqa: E402
+from eval import alias_message, case_env, install_copy, parse, seed_files, verdict  # noqa: E402
 
 FIRES = {"id": "a", "message": "m", "expect": "fires", "judge": "j"}
 SILENT = {"id": "b", "message": "m", "expect": "silent", "judge": "j"}
@@ -48,6 +48,7 @@ class VerdictTest(unittest.TestCase):
     def test_rules(self):
         self.assertEqual(verdict(FIRES, "x", ["x"], 0, "r", False), "pass")
         self.assertEqual(verdict(FIRES, "x", ["x"], 1, "r", False), "FAIL")
+        self.assertEqual(verdict({**FIRES, "allow_edits": True}, "x", ["x"], 1, "r", False), "pass")
         self.assertEqual(verdict(FIRES, "x", [], 0, "r", False), "FAIL")
         self.assertEqual(verdict(SILENT, "x", [], 0, "r", False), "pass")
         self.assertEqual(verdict(SILENT, "x", ["x"], 0, "r", False), "FAIL")
@@ -66,6 +67,35 @@ class InstallCopyTest(unittest.TestCase):
             text = (work / ".claude/skills/expert-eval/SKILL.md").read_text()
             self.assertIn("name: expert-eval\n", text)
             self.assertIn("body name: keep", text)
+
+
+class FixturesAndEnvTest(unittest.TestCase):
+    def test_seed_text_and_base64_and_reject_traversal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            seed_files(work, {"docs/a.md": "hello", "img/x.bin": "base64:iVBORw0KGgo="})
+            self.assertEqual((work / "docs/a.md").read_text(), "hello")
+            self.assertEqual((work / "img/x.bin").read_bytes(), b"\x89PNG\r\n\x1a\n")
+            with self.assertRaises(ValueError):
+                seed_files(work, {"../escape.txt": "nope"})
+            with self.assertRaises(ValueError):
+                seed_files(work, {"/abs.txt": "nope"})
+
+    def test_seed_rejects_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / "outside"
+            outside.mkdir()
+            work = root / "work"
+            work.mkdir()
+            (work / "link").symlink_to(outside)
+            with self.assertRaises(ValueError):
+                seed_files(work, {"link/escaped.txt": "nope"})
+            self.assertFalse((outside / "escaped.txt").exists())
+
+    def test_case_env_precedence(self):
+        merged = case_env({"A": "1", "B": "2"}, {"B": "suite", "C": "3"}, {"C": "case"})
+        self.assertEqual(merged, {"A": "1", "B": "suite", "C": "case"})
 
 
 if __name__ == "__main__":
