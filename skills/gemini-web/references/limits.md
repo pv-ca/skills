@@ -20,6 +20,10 @@ not quoted) or "not verified".
 
 - Two windows, read by the script from the web app: a 5-hour window and a weekly one, both in credits. The
   5-hour window renews every 5 hours until the weekly credits are spent (documented).
+- Run `scripts/gemini_web.py --quota` to read both windows (remaining credits, `% used`, and `reset_at`
+  timestamps when present, plus account `tier` and `ai_credits_remaining` if returned) without spending
+  credits. During calls, stderr emits deterministic threshold notices at `>=50%`, `>=75%`, and `>=90%` usage,
+  and exit 4 includes window reset times when available.
 - When the quota is spent, subscribers continue with a lightweight model (Flash-Lite, documented). The
   script tries to detect that through the model label in the response; see section 8.
 - Deep Research counts as "high" use and analysis of a large file as "medium" (documented). The pages do
@@ -107,17 +111,20 @@ not answer quality.
 
 ## 6. Deep Research, images and video
 
-One call each on 2026-11-24, so a guide and not a measurement:
+One call per setting on 2026-11-24 on one PRO account, so read as a guide and not a distribution:
 
 | Mode | Result | Credits | Time |
 | --- | --- | --- | --- |
-| image (`--model carbon`) | JPEG 77 KB, as asked | 3 | 19 s |
-| image with `--ref` (edit) | the requested change, the rest kept | not read | 23 s |
-| video (`--model carbon`) | MP4 1280x720, H.264 and AAC audio, 10 s, 2.8 MB, plus a thumbnail | about 880 | 350 s |
+| image (`--model carbon`, default) | JPEG 1024x1024, labelled `Nano Banana 2 Lite` (2 calls) | 3 | 19 to 20 s |
+| image (`--model gemini-auto`) | JPEG 1024x1024, labelled `Nano Banana 2 Lite` | 3 | 18 s |
+| image (`--model carbon`, extended thinking forced) | JPEG 1024x1024, still labelled `Nano Banana 2 Lite` | 6 | 11 s |
+| image (`--model hydrogen`) | JPEG 1024x1024, labelled `Nano Banana 2.1` | 30 | 23 s |
+| image (`--model neon`) | JPEG 1024x1024, labelled `Nano Banana 2.1` | 31 | 25 s |
+| image with `--ref` (`--model carbon`) | the requested change, the rest kept (`Nano Banana 2 Lite`) | not read | 23 s |
+| video (`--model carbon`, default) | MP4 1280x720, H.264 and AAC audio, 10 s, 2.8 MB, plus a thumbnail (no label) | about 880 | 350 s |
 | Deep Research (`--model hydrogen`) | plan and start worked; no report after 26 minutes; exit 5 | 16 visible | 1256 s before giving up |
 
-- Images were labelled `Nano Banana 2 Lite` although `carbon` was asked. Whether that is the normal route or a
-  fallback is not resolved. The script does not check labels for images and video.
+- Image routing depends on `--model` on this account: `carbon` and `gemini-auto` routed to `Nano Banana 2 Lite` (~2 to 3 credits), whereas `hydrogen` and `neon` routed to `Nano Banana 2.1` (~30 to 31 credits, ~10x higher cost). Forcing extended thinking on `carbon` did not switch to `Nano Banana 2.1`. In 5 follow-up calls on 2026-11-24, `--aspect` produced matching full-bleed outputs (`16:9` -> `1376x768`, `9:16` -> `768x1376`, `4:5` -> `928x1152` on `carbon`; `16:9` -> `1376x768` on `hydrogen`) and `--prompt-file` with structured JSON + `--aspect 16:9` succeeded on `carbon` (`1376x768`, 2 credits). Whether other accounts route identically, and whether `--aspect` holds in `--mode video` or unusual ratios, is not verified. The script does not fail on image or video labels; it only logs them on stderr.
 - The video chat and the research chat stay in the web history (the video flow needs it). Delete them by hand
   when you are done.
 - Deep Research is unconfirmed: the conversation shows the plan and a "working on it" reply, and the report was
@@ -134,8 +141,8 @@ ask", with no "off", which is why capturing it safely needs the connectors switc
 
 ## 8. What is not known
 
-- Whether quality differs between Hydrogen and Neon, or between effort levels: the screening had 1 to 5
-  usable hard cases per setting.
+- Whether quality differs between effort levels: the screening had 1 to 5 usable hard cases per setting.
+  Neon answers better than Hydrogen in the user's experience; the screening did not measure it.
 - The model label in the response for `neon high` (low `4 Neon` and medium `4 Neon Medium` were observed, but `neon high` was not), and what any label shows during a real fallback to a lightweight model. The Hydrogen labels at the three effort levels were seen once each.
 - The cause of the failure bursts: time of day, thinking level, or something else.
 - How long attachments and Deep Research chats stay on the server.

@@ -5,10 +5,10 @@ Send text, clean attached files, image generation/editing, short video generatio
 ## What it does
 
 It wraps `scripts/gemini_web.py`, which talks to Gemini on the web with the Google cookies of a browser where you are
-already logged in. You choose the model (`hydrogen`, `neon`, `carbon`, or any model returned by `--list-models`) and the thinking level (`low`, `medium`, `high`), attach
-regular files up to 300 KB in total, generate and edit images, make short videos, or try a Deep Research run (unconfirmed), all on a quota separate from your primary coding model's. Chats are
-temporary by default. The script refuses symlinks, folders, empty files and oversized attachments before anything is sent,
-skips the call when your 5-hour window is nearly spent, retries the app's canned error notices, flags a silent change of
+already logged in (or a private `cookies.json` export via `--cookies-file`, for Windows or locked keyrings). You choose the model (`hydrogen`, `neon`, `carbon`, or any model returned by `--list-models`; defaults are `hydrogen` for text/research and `carbon` for image/video) and the thinking level (`low`, `medium`, `high`), attach
+regular files up to 300 KB in total, pass `--prompt-file` or `--aspect W:H`, generate and edit images, make short videos, check balances with `--quota` (0 credits), or try a Deep Research run (unconfirmed), all on a quota separate from your primary coding model's. Chats are
+temporary by default. The script refuses symlinks, folders, empty files and oversized attachments or prompt files before anything is sent,
+warns on high quota usage and skips the call (with window reset times) when your 5-hour window is nearly spent, retries the app's canned error notices, flags a silent change of
 model or thinking level, isolates the library's cookie cache in a per-run `0700` folder, and never prints or logs cookies. Gemini Tasks is not supported and the script refuses it.
 
 ## When to reach for it

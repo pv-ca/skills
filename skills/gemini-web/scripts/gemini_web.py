@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Call your own logged-in Gemini web session from a script: prompt on stdin (or --prompt), reply or saved paths on stdout.
+"""Call your own logged-in Gemini web session from a script: prompt on stdin (or --prompt / --prompt-file), reply or saved paths on stdout.
 
   gemini_web.py [--mode chat|tasks|research|image|video] [--model MODEL] [--effort low|medium|high] [--keep]
-                [--files F ...] [--ref IMG ...] [--confirm-apps-off] [--output FILE] [--output-dir DIR]
-                [--prompt TEXT] [--timeout S] [--browser auto|edge|chrome|...] [--list-models] [--estimate] [--selftest]
+                [--files F ...] [--ref IMG ...] [--aspect W:H] [--confirm-apps-off] [--output FILE] [--output-dir DIR]
+                [--prompt TEXT | --prompt-file FILE] [--timeout S] [--browser auto|edge|chrome|...]
+                [--cookies-file FILE] [--list-models] [--quota] [--estimate] [--selftest]
 
-The session comes from the Google cookies of a browser where you are logged in to gemini.google.com (browser-cookie3);
-nothing else is needed. Install the dependencies with: pip install -r requirements.txt
+The session comes from the Google cookies of a browser where you are logged in to gemini.google.com (browser-cookie3),
+or from a private JSON cookie export (--cookies-file / $GEMINI_WEB_COOKIES_FILE / ~/.local/share/gemini-web/cookies.json).
+Install the dependencies with: pip install -r requirements.txt
 Diagnostics go to stderr, the reply (or saved media paths, one per line) to stdout (or --output / --output-dir).
 
 Exit codes:
-  0 reply, saved media paths, --estimate, or --list-models
-  1 empty reply, no generated media after retries, download error, or API error
-  2 bad arguments, bad file or reference image, unknown model, missing dependency, or auth failure
+  0 reply, saved media paths, --estimate, --quota, or --list-models
+  1 empty reply, no generated media after retries, download error, missing quota data, or API error
+  2 bad arguments, bad file/prompt-file/cookies-file/reference image, unknown model, missing dependency, or auth failure
   3 canned refusal or media policy refusal that survived two retries
   4 usage limit (hard limit, quota text, 5h window nearly spent, or 5h credits below estimate)
   5 timeout (including video polling)
@@ -23,7 +25,7 @@ Failed text calls cost no credits (measured; unverified for image/video), so ret
 90 s pauses, in a new conversation. One line per call goes to $GEMINI_WEB_LOG (default ~/.local/share/gemini-web/calls.jsonl):
 credits of both windows before and after, sizes, the answering model's label, conversation id. Never cookies, prompts or replies.
 """
-import argparse, asyncio, contextlib, importlib.util, json, os, random, re, shutil, sys, tempfile, time
+import argparse, asyncio, contextlib, importlib.util, json, os, random, re, shutil, stat, sys, tempfile, time
 from datetime import datetime
 from pathlib import Path
 
@@ -33,9 +35,14 @@ DEFAULT_LOG_DIR = Path.home() / ".local/share/gemini-web"
 MODELS = {"hydrogen": "gemini-4-hydrogen", "neon": "gemini-neon", "carbon": "gemini-carbon"}
 LEVEL = {"low": 1, "medium": 4, "high": 2}  # request field 81; the library only knows 1 and 2, medium (4) is patched below
 MAX_FILES_BYTES = 300_000  # one measurement: a 1.78 MB text file was truncated near 380 KB without any error, so stay under that
+MAX_PROMPT_FILE_BYTES = 300_000  # safety cap for --prompt-file aligned with MAX_FILES_BYTES
+MAX_COOKIES_FILE_BYTES = 1_000_000  # 1 MB safety cap for --cookies-file JSON exports
 MAX_REF_FILE_BYTES = 10_000_000  # 10 MB per reference image (safety cap; actual server limit is not verified)
 MAX_REF_TOTAL_BYTES = 20_000_000  # 20 MB total across --ref images (not verified against server cap)
 ALLOWED_REF_EXTS = {".png", ".jpg", ".webp", ".gif"}
+ASPECT_RE = re.compile(r"\A(\d{1,2}):(\d{1,2})\Z")
+COOKIE_DOMAIN_RE = re.compile(r"\A[a-z0-9.-]+\Z")
+QUOTA_WARN_BANDS = (90, 75, 50)
 MIN_5H_LEFT_PCT = int(os.environ.get("GEMINI_WEB_MIN_5H_LEFT_PCT", "10"))
 RETRY_WAITS = [30, 90]  # seconds before retry 1 and retry 2
 # Measured credit ranges from one account on 2026-11-24. Unlisted modes/models (including research) are unmeasured.
@@ -43,11 +50,14 @@ ESTIMATED_CREDITS = {
     ("chat", "hydrogen", "low"): (3, 6),
     ("chat", "hydrogen", "medium"): (5, 9),
     ("chat", "hydrogen", "high"): (9, 22),
-    # one call each for neon low, image and video (2026-11-24): treat as a rough guide, the real range is unknown
+    # one call each for neon low, images per model, and video (2026-11-24): treat as a rough guide, the real range is unknown
     ("chat", "neon", "low"): (6, 6),
     ("chat", "neon", "medium"): (43, 43),
     ("chat", "neon", "high"): (79, 79),
     ("image", "carbon", "high"): (3, 3),
+    ("image", "auto", "high"): (3, 3),
+    ("image", "hydrogen", "high"): (30, 30),
+    ("image", "neon", "high"): (31, 31),
     ("video", "carbon", "high"): (880, 880),
 }
 # Mode-level fallback for image/video so the 5h credit guard still protects against high spend when another --model is passed.
@@ -330,6 +340,131 @@ def format_estimate(mode: str, model: str, effort: str) -> str:
     return f"mode={mode} model={tok} effort={eff}: estimated credits={span} (measured on one account, 2026-11-24)"
 
 
+def default_model_for_mode(mode: str) -> str:
+    """Returns the default model alias for a mode: carbon for image/video, hydrogen for text modes."""
+    return "carbon" if mode in ("image", "video") else "hydrogen"
+
+
+def validate_aspect(value: str) -> str:
+    """Validates an aspect ratio string W:H (1-2 digits each, both positive). Returns normalized 'W:H' or raises ValueError."""
+    if not isinstance(value, str):
+        raise ValueError("invalid --aspect: expected W:H (e.g. 16:9, 4:5, 1:1)")
+    m = ASPECT_RE.match(value)
+    if not m:
+        raise ValueError(f"invalid --aspect '{value}': expected W:H with 1-2 positive digits each (e.g. 16:9, 4:5, 1:1)")
+    w, h = int(m.group(1)), int(m.group(2))
+    if w <= 0 or h <= 0:
+        raise ValueError(f"invalid --aspect '{value}': width and height must both be positive")
+    return f"{w}:{h}"
+
+
+def _open_regular_nofollow(abs_p: Path) -> int:
+    """Opens an absolute path without following symlinks at any directory or leaf component (uses openat/dir_fd on POSIX)."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if hasattr(os, "O_DIRECTORY") and os.open in getattr(os, "supports_dir_fd", set()) and abs_p.is_absolute():
+        parts = abs_p.parts
+        if len(parts) < 2:
+            raise OSError("not a regular file")
+        dir_fd = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in parts[1:-1]:
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=dir_fd)
+                os.close(dir_fd)
+                dir_fd = next_fd
+            return os.open(parts[-1], os.O_RDONLY | nofollow, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+    return os.open(abs_p, os.O_RDONLY | nofollow)
+
+
+def read_prompt_file(path_str: str) -> str:
+    """Reads --prompt-file safely: no symlinks along any path component, regular non-empty UTF-8 file within MAX_PROMPT_FILE_BYTES."""
+    if not isinstance(path_str, str) or not path_str.strip():
+        raise ValueError("--prompt-file must not be empty")
+    p, abs_p = _reject_symlink_prefix(path_str)
+    if not p.exists():
+        raise ValueError(f"{path_str}: prompt file does not exist")
+    if p.is_symlink() or not p.is_file():
+        raise ValueError(f"{path_str}: not a regular file (links and folders are refused)")
+    try:
+        fd = _open_regular_nofollow(abs_p)
+    except OSError as e:
+        raise ValueError(f"{path_str}: cannot open prompt file ({e.strerror or e})") from e
+    try:
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError(f"{path_str}: not a regular file")
+            if st.st_size == 0:
+                raise ValueError(f"{path_str}: prompt file is empty")
+            if st.st_size > MAX_PROMPT_FILE_BYTES:
+                raise ValueError(f"{path_str}: prompt file is {st.st_size} bytes, over the {MAX_PROMPT_FILE_BYTES} limit")
+            with os.fdopen(fd, "rb") as f:
+                fd = -1
+                raw = f.read(MAX_PROMPT_FILE_BYTES + 1)
+        except OSError as e:
+            raise ValueError(f"{path_str}: cannot read prompt file ({e.strerror or e})") from e
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) == 0:
+        raise ValueError(f"{path_str}: prompt file is empty")
+    if len(raw) > MAX_PROMPT_FILE_BYTES:
+        raise ValueError(f"{path_str}: prompt file exceeds the {MAX_PROMPT_FILE_BYTES} byte limit")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"{path_str}: prompt file is not valid UTF-8 ({e})") from e
+    if not text.lstrip("\ufeff").strip():
+        raise ValueError(f"{path_str}: prompt file contains only whitespace")
+    return text
+
+
+def check_not_same_file(path_a: Path, path_b_str: str, label_a: str, label_b: str) -> None:
+    """Refuses when path_a resolves to the same file (or hard link) as path_b_str."""
+    _, b_abs = _reject_symlink_prefix(path_b_str)
+    if path_a == b_abs:
+        raise ValueError(f"{label_a} ({path_a}) must not be the same file as {label_b}")
+    try:
+        if path_a.exists() and b_abs.exists() and os.path.samefile(path_a, b_abs):
+            raise ValueError(f"{label_a} ({path_a}) refers to the same file as {label_b}")
+    except OSError:
+        pass
+
+
+def check_distinct_output_and_prompt(out_file: Path, prompt_file_path: str) -> None:
+    """Refuses --output when it resolves to the same file (or hard link) as --prompt-file to prevent O_TRUNC data loss."""
+    check_not_same_file(out_file, prompt_file_path, "--output", "--prompt-file")
+
+
+def is_structured_json(text: str) -> bool:
+    """Returns True if text parses as a JSON object or array (tolerates leading UTF-8 BOM and excessive nesting)."""
+    s = text.lstrip("\ufeff").strip()
+    if not s or s[0] not in ("{", "["):
+        return False
+    try:
+        val = json.loads(s)
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(val, (dict, list))
+
+
+def prepare_prompt(prompt: str, mode: str, aspect: str | None = None) -> str:
+    """Applies --aspect and structured-JSON media framing for image/video modes; leaves text modes unchanged."""
+    if mode not in ("image", "video"):
+        return prompt
+    clean = prompt.lstrip("\ufeff").strip()
+    if is_structured_json(clean):
+        aspect_clause = f" in a {aspect} aspect ratio" if aspect else ""
+        return (
+            f"Generate the {mode} described by the following JSON specification{aspect_clause}. "
+            f"Return the generated {mode} directly rather than a text reply.\n\n{clean}"
+        )
+    if aspect:
+        return f"{prompt.rstrip()}\n\nTarget aspect ratio: {aspect}."
+    return prompt
+
+
 def validate_args(args) -> tuple[int, str]:
     """Pure argument validator. Returns (0, '') when valid or (exit_code, error_message)."""
     if args.timeout <= 0:
@@ -338,6 +473,25 @@ def validate_args(args) -> tuple[int, str]:
         if not args.confirm_apps_off:
             return 7, "tasks mode can act on connected apps and the browser; pass --confirm-apps-off only after checking they are off"
         return 6, "tasks mode is not implemented: the request field for Tasks was never captured (see references/limits.md)"
+    if args.model is not None and not str(args.model).strip():
+        return 2, "--model must not be empty"
+    cookies_file = getattr(args, "cookies_file", None)
+    if cookies_file is not None and not str(cookies_file).strip():
+        return 2, "--cookies-file must not be empty"
+    prompt_val = getattr(args, "prompt", None)
+    prompt_file = getattr(args, "prompt_file", None)
+    if prompt_val is not None and prompt_file is not None:
+        return 2, "pass either --prompt or --prompt-file, not both"
+    if prompt_file is not None and not str(prompt_file).strip():
+        return 2, "--prompt-file must not be empty"
+    aspect = getattr(args, "aspect", None)
+    if aspect is not None:
+        if args.mode not in ("image", "video"):
+            return 2, "--aspect is only supported in image and video modes"
+        try:
+            validate_aspect(aspect)
+        except ValueError as e:
+            return 2, str(e)
     if args.mode == "chat":
         if args.ref:
             return 2, "chat mode uses --files, not --ref"
@@ -445,11 +599,12 @@ def _find_venv_python(script_path: Path | None = None) -> Path | None:
     return None
 
 
-def _maybe_reexec_venv() -> None:
-    """Re-execs into a configured venv when the active Python lacks gemini-webapi/browser-cookie3/curl_cffi."""
+def _maybe_reexec_venv(need_browser_cookies: bool = True) -> None:
+    """Re-execs into a configured venv when the active Python lacks required runtime modules."""
     if os.environ.get("_GEMINI_WEB_REEXEC") == "1":
         return
-    if all(importlib.util.find_spec(m) is not None for m in REQUIRED_MODULES):
+    mods = REQUIRED_MODULES if need_browser_cookies else ("curl_cffi", "gemini_webapi")
+    if all(importlib.util.find_spec(m) is not None for m in mods):
         return
     venv_py = _find_venv_python()
     if venv_py is None:
@@ -500,43 +655,378 @@ def log(log_path: Path | None = None, **row):
         pass
 
 
+def parse_usage_info(ui) -> dict:
+    """Normalizes client.usage_info into a stable dict with credits, percentages, reset_at, tier, and AI credits."""
+    ui = ui if isinstance(ui, dict) else {}
+
+    def _win(key: str) -> dict:
+        w = ui.get(key)
+        return w if isinstance(w, dict) else {}
+
+    h5 = _win("current_5h")
+    wk = _win("weekly")
+    tier_obj = ui.get("tier")
+    tier_label = None
+    if isinstance(tier_obj, dict):
+        tier_label = tier_obj.get("label")
+        if not tier_label and tier_obj.get("id") is not None:
+            tier_label = f"tier-{tier_obj['id']}"
+    elif isinstance(tier_obj, str) and tier_obj.strip():
+        tier_label = tier_obj.strip()
+    ai_credits = ui.get("ai_credits_remaining")
+    if isinstance(ai_credits, bool) or not isinstance(ai_credits, (int, float)):
+        ai_credits = None
+    h5_reset = h5.get("reset_at")
+    wk_reset = wk.get("reset_at")
+    return {
+        "h5": [h5.get("remaining_credits"), h5.get("usage_percentage")],
+        "wk": [wk.get("remaining_credits"), wk.get("usage_percentage")],
+        "h5_reset": h5_reset.strip() if isinstance(h5_reset, str) and h5_reset.strip() else None,
+        "wk_reset": wk_reset.strip() if isinstance(wk_reset, str) and wk_reset.strip() else None,
+        "tier": tier_label,
+        "ai_credits": ai_credits,
+    }
+
+
+def has_usage_data(u: dict | None) -> bool:
+    """Returns True when at least one window metric or ai_credits value is populated."""
+    if not isinstance(u, dict):
+        return False
+    h5 = u.get("h5") or [None, None]
+    wk = u.get("wk") or [None, None]
+    return any(v is not None for v in (h5[0], h5[1], wk[0], wk[1], u.get("ai_credits")))
+
+
+def _format_reset_time(reset_at: str | None) -> str:
+    """Formats an ISO-8601 reset timestamp concisely (to minutes), or returns '' when unavailable."""
+    if not isinstance(reset_at, str) or not reset_at.strip():
+        return ""
+    raw = reset_at.strip()
+    try:
+        return datetime.fromisoformat(raw).isoformat(timespec="minutes")
+    except ValueError:
+        return raw
+
+
+def format_reset_hint(u: dict | None, window: str = "h5") -> str:
+    """Returns ' (resets ...)' for one window or both windows when available, else ''."""
+    if not isinstance(u, dict):
+        return ""
+    if window == "both":
+        parts: list[str] = []
+        for label, rkey in (("5h", "h5_reset"), ("weekly", "wk_reset")):
+            rst = _format_reset_time(u.get(rkey))
+            if rst:
+                parts.append(f"{label} resets {rst}")
+        return f" ({'; '.join(parts)})" if parts else ""
+    rkey = "h5_reset" if window == "h5" else "wk_reset"
+    rst = _format_reset_time(u.get(rkey))
+    return f" (resets {rst})" if rst else ""
+
+
+def format_quota(u: dict) -> str:
+    """Formats normalized usage data for stable stdout output from --quota."""
+    lines: list[str] = []
+    if u.get("tier"):
+        lines.append(f"tier: {u['tier']}")
+    for label, key, rkey in (("5h", "h5", "h5_reset"), ("weekly", "wk", "wk_reset")):
+        rem, pct = u.get(key) or [None, None]
+        parts = [
+            f"{rem} credits left" if rem is not None else "credits=n/a",
+            f"{pct}% used" if pct is not None else "used=n/a",
+        ]
+        rst = _format_reset_time(u.get(rkey))
+        if rst:
+            parts.append(f"resets {rst}")
+        lines.append(f"{label}: {', '.join(parts)}")
+    if u.get("ai_credits") is not None:
+        lines.append(f"ai_credits: {u['ai_credits']} left")
+    return "\n".join(lines)
+
+
+def _quota_band(pct) -> int | None:
+    if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+        return None
+    return next((b for b in QUOTA_WARN_BANDS if pct >= b), None)
+
+
+def quota_bands(u: dict | None) -> dict[str, int]:
+    """Returns {window_label: highest_crossed_band} for deduplicating pre- and post-call warnings."""
+    if not isinstance(u, dict):
+        return {}
+    out: dict[str, int] = {}
+    for label, key in (("5h", "h5"), ("weekly", "wk")):
+        _, pct = u.get(key) or [None, None]
+        band = _quota_band(pct)
+        if band is not None:
+            out[label] = band
+    return out
+
+
+def quota_warnings(u: dict | None, windows: tuple[str, ...] = ("5h", "weekly"), min_band_by_window: dict[str, int] | None = None) -> list[str]:
+    """Returns deterministic stderr warning lines when 5h or weekly usage reaches >=50%, >=75%, or >=90%.
+
+    When min_band_by_window is provided, emits a window only if its band strictly exceeds the previous band.
+    """
+    if not isinstance(u, dict):
+        return []
+    specs = (("5h", "h5", "h5_reset"), ("weekly", "wk", "wk_reset"))
+    warns: list[str] = []
+    for label, key, rkey in specs:
+        if label not in windows:
+            continue
+        rem, pct = u.get(key) or [None, None]
+        band = _quota_band(pct)
+        if band is None:
+            continue
+        if min_band_by_window is not None and band <= min_band_by_window.get(label, 0):
+            continue
+        sev = {90: "critical", 75: "high", 50: "notice"}[band]
+        rem_s = f", {rem} credits left" if rem is not None else ""
+        rst = _format_reset_time(u.get(rkey))
+        rst_s = f", resets {rst}" if rst else ""
+        warns.append(f"quota {sev} (>={band}%): {label} window at {pct}%{rem_s}{rst_s}")
+    return warns
+
+
+def format_skip_5h(u: dict, limit_pct: int) -> str:
+    return f"5h window at {u['h5'][1]}% (limit {limit_pct}%){format_reset_hint(u, 'h5')}: not calling"
+
+
+def format_skip_5h_est(u: dict, est: tuple[int, int]) -> str:
+    return f"5h window has {u['h5'][0]} credits left, below estimated {est[0]}-{est[1]}{format_reset_hint(u, 'h5')}: not calling"
+
+
+def format_limit_detail(detail: str, u: dict | None) -> str:
+    return f"{detail}{format_reset_hint(u, 'both')}"
+
+
+def _merge_window(w0, w1) -> list:
+    a = w0 if isinstance(w0, (list, tuple)) and len(w0) == 2 else [None, None]
+    b = w1 if isinstance(w1, (list, tuple)) and len(w1) == 2 else [None, None]
+    return [b[0] if b[0] is not None else a[0], b[1] if b[1] is not None else a[1]]
+
+
+def merge_usage(u0: dict, u1: dict) -> dict:
+    """Uses post-call u1 fields when non-None, falling back per field to pre-call u0 when u1 is empty or partial."""
+    if has_usage_data(u1):
+        return {
+            "h5": _merge_window(u0.get("h5"), u1.get("h5")),
+            "wk": _merge_window(u0.get("wk"), u1.get("wk")),
+            "h5_reset": u1.get("h5_reset") or u0.get("h5_reset"),
+            "wk_reset": u1.get("wk_reset") or u0.get("wk_reset"),
+            "tier": u1.get("tier") or u0.get("tier"),
+            "ai_credits": u1.get("ai_credits") if u1.get("ai_credits") is not None else u0.get("ai_credits"),
+        }
+    return u0
+
+
 async def usage(c):
     for f in ("_fetch_quota", "_fetch_usage_info"):
         try: await getattr(c, f)()
         except Exception: pass
-    ui = c.usage_info or {}
-    s = lambda k: ui.get(k) or {}
-    return {"h5": [s("current_5h").get("remaining_credits"), s("current_5h").get("usage_percentage")],
-            "wk": [s("weekly").get("remaining_credits"), s("weekly").get("usage_percentage")]}
+    return parse_usage_info(getattr(c, "usage_info", None))
 
 
 BROWSERS = ["edge", "chrome", "chromium", "brave", "firefox", "vivaldi", "opera", "librewolf"]
 
 
-def load_cookies(browser="auto"):
-    """Reads the Google cookies of a browser where you are logged in to Gemini. Returns (browser name, cookie list); values are never printed."""
-    import browser_cookie3 as bc
-    for name in (BROWSERS if browser == "auto" else [browser]):
-        try:
-            jar = list(getattr(bc, name)(domain_name="google.com"))
-        except Exception:  # profile not found, keyring locked, browser not installed
+def default_cookies_file() -> Path:
+    """Default private cookies.json path used as fallback when browser cookie extraction fails."""
+    xdg_data = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg_data) / "gemini-web" if xdg_data else DEFAULT_LOG_DIR
+    return base / "cookies.json"
+
+
+def _is_google_cookie_domain(domain: str) -> bool:
+    """Returns True only for google.com and subdomains (*.google.com); rejects lookalikes, whitespace/control chars, and unrelated domains."""
+    if not isinstance(domain, str) or any(ch in domain for ch in "\r\n\x00\t "):
+        return False
+    raw = domain.lower()
+    if not raw or ".." in raw:
+        return False
+    host = raw[1:] if raw.startswith(".") else raw
+    if not host or host.startswith(".") or host.endswith(".") or not COOKIE_DOMAIN_RE.match(host):
+        return False
+    return host == "google.com" or host.endswith(".google.com")
+
+
+def _covers_gemini_root(domain: str, path: str) -> bool:
+    """Returns True only when a cookie's domain and path are sent on requests to https://gemini.google.com/."""
+    if not _is_google_cookie_domain(domain):
+        return False
+    host = domain.lower().lstrip(".")
+    clean_path = path if isinstance(path, str) and path else "/"
+    return host in ("google.com", "gemini.google.com") and clean_path == "/"
+
+
+def select_session_cookies(cookies) -> tuple[str | None, str | None]:
+    """Selects non-empty (__Secure-1PSID, __Secure-1PSIDTS) from cookies covering https://gemini.google.com/.
+
+    Prefers .google.com over gemini.google.com when both exist.
+    """
+    best: dict[str, tuple[int, str]] = {}
+    for ck in cookies:
+        name = getattr(ck, "name", None)
+        if name not in ("__Secure-1PSID", "__Secure-1PSIDTS"):
             continue
-        if any(c.name == "__Secure-1PSID" for c in jar):
-            return name, jar
-    raise RuntimeError("no browser with a logged-in Google session found (log in to gemini.google.com there, or pass --browser)")
+        val = getattr(ck, "value", None)
+        if not isinstance(val, str) or not val.strip():
+            continue
+        dom = getattr(ck, "domain", ".google.com") or ".google.com"
+        path = getattr(ck, "path", "/") or "/"
+        if not _covers_gemini_root(dom, path):
+            continue
+        prio = 2 if dom.lower().lstrip(".") == "google.com" else 1
+        prev = best.get(name)
+        if prev is None or prio >= prev[0]:
+            best[name] = (prio, val)
+    return (best["__Secure-1PSID"][1] if "__Secure-1PSID" in best else None,
+            best["__Secure-1PSIDTS"][1] if "__Secure-1PSIDTS" in best else None)
 
 
-async def make_client(browser="auto", timeout=90):
+def _make_cookie_obj(name: str, value: str, domain: str = ".google.com", path: str = "/"):
+    if not isinstance(name, str) or not name.strip() or any(ch in name for ch in "\r\n\x00\t"):
+        raise ValueError("cookies file contains an invalid cookie name")
+    if not isinstance(value, str) or any(ch in value for ch in "\r\n\x00"):
+        raise ValueError("cookies file contains an invalid cookie value")
+    clean_path = path if (isinstance(path, str) and path.startswith("/") and not any(ch in path for ch in "\r\n\x00")) else "/"
+    return argparse.Namespace(name=name.strip(), value=value, domain=domain.strip().lower(), path=clean_path)
+
+
+def _parse_cookies_payload(data) -> list:
+    """Parses JSON cookie exports (browser list, {'cookies': [...]}, or flat {name: value} dict) filtered to google.com."""
+    if isinstance(data, dict) and isinstance(data.get("cookies"), list):
+        items = data["cookies"]
+    elif isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        cookies = []
+        for k, v in data.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                raise ValueError("flat cookies JSON object must map cookie names to string values")
+            cookies.append(_make_cookie_obj(k, v, ".google.com", "/"))
+        if not select_session_cookies(cookies)[0]:
+            raise ValueError("cookies file contains no non-empty __Secure-1PSID cookie covering gemini.google.com/")
+        return cookies
+    else:
+        raise ValueError("cookies file must be a JSON array of cookie objects or a JSON object")
+
+    cookies = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("cookies file array must contain JSON objects")
+        domain = item.get("domain", ".google.com")
+        if not isinstance(domain, str) or not _is_google_cookie_domain(domain):
+            continue  # drop non-Google cookies from multi-site browser exports without leaking them
+        name = item.get("name")
+        value = item.get("value")
+        path = item.get("path", "/")
+        cookies.append(_make_cookie_obj(name, value, domain, path))
+    if not select_session_cookies(cookies)[0]:
+        raise ValueError("cookies file contains no non-empty __Secure-1PSID cookie covering gemini.google.com/")
+    return cookies
+
+
+def load_cookies_file(path_str: str) -> list:
+    """Loads Google cookies from a private JSON file (no symlinks, mode 0600 on POSIX, <=1 MB, valid UTF-8 JSON)."""
+    if not isinstance(path_str, str) or not path_str.strip():
+        raise ValueError("--cookies-file must not be empty")
+    p, abs_p = _reject_symlink_prefix(path_str)
+    if not p.exists():
+        raise ValueError(f"{path_str}: cookies file does not exist")
+    if p.is_symlink() or not p.is_file():
+        raise ValueError(f"{path_str}: not a regular file (links and folders are refused)")
+    try:
+        fd = _open_regular_nofollow(abs_p)
+    except OSError as e:
+        raise ValueError(f"{path_str}: cannot open cookies file ({e.strerror or e})") from e
+    try:
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError(f"{path_str}: not a regular file")
+            if os.name == "posix":
+                if st.st_uid != os.getuid():
+                    raise ValueError(f"{path_str}: cookies file must be owned by the current user")
+                if (st.st_mode & 0o077) != 0:
+                    raise ValueError(f"{path_str}: cookies file permissions are too open (run: chmod 600)")
+            if st.st_size == 0:
+                raise ValueError(f"{path_str}: cookies file is empty")
+            if st.st_size > MAX_COOKIES_FILE_BYTES:
+                raise ValueError(f"{path_str}: cookies file is {st.st_size} bytes, over the {MAX_COOKIES_FILE_BYTES} limit")
+            with os.fdopen(fd, "rb") as f:
+                fd = -1
+                raw = f.read(MAX_COOKIES_FILE_BYTES + 1)
+        except OSError as e:
+            raise ValueError(f"{path_str}: cannot read cookies file ({e.strerror or e})") from e
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) == 0:
+        raise ValueError(f"{path_str}: cookies file is empty")
+    if len(raw) > MAX_COOKIES_FILE_BYTES:
+        raise ValueError(f"{path_str}: cookies file exceeds the {MAX_COOKIES_FILE_BYTES} byte limit")
+    try:
+        text = raw.decode("utf-8").lstrip("\ufeff")
+    except UnicodeDecodeError:
+        raise ValueError(f"{path_str}: cookies file is not valid UTF-8") from None
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        raise ValueError(f"{path_str}: cookies file is not valid JSON") from None
+    return _parse_cookies_payload(data)
+
+
+def load_cookies(browser="auto", cookies_file=None):
+    """Reads Google cookies from --cookies-file, a logged-in browser (browser-cookie3), or default cookies.json fallback.
+
+    Returns (source label, cookie list); cookie values are never printed.
+    """
+    if cookies_file is not None:
+        return "cookies-file", load_cookies_file(cookies_file)
+    try:
+        import browser_cookie3 as bc
+    except ImportError:
+        bc = None
+    if bc is not None:
+        for name in (BROWSERS if browser == "auto" else [browser]):
+            try:
+                jar = list(getattr(bc, name)(domain_name="google.com"))
+            except Exception:  # profile not found, keyring locked, browser not installed
+                continue
+            if select_session_cookies(jar)[0]:
+                return name, jar
+    if browser == "auto":
+        fallback = default_cookies_file()
+        if fallback.exists() or fallback.is_symlink():
+            return "cookies-file", load_cookies_file(str(fallback))
+    if bc is None:
+        raise ImportError("browser_cookie3")
+    raise RuntimeError(
+        "no browser with a logged-in Google session found "
+        "(log in to gemini.google.com there, pass --browser, or pass --cookies-file)"
+    )
+
+
+async def _init_client_from_cookies(used: str, cookies, timeout: int):
     from curl_cffi.requests import Cookies
     from gemini_webapi import GeminiClient, set_log_level
     import gemini_webapi.exceptions as gex
+    from gemini_webapi.constants import AccountStatus
     set_log_level("CRITICAL")
-    used, cookies = load_cookies(browser)
-    by_name = {c.name: c.value for c in cookies}
-    c = GeminiClient(by_name["__Secure-1PSID"], by_name.get("__Secure-1PSIDTS"))
+    psid, psidts = select_session_cookies(cookies)
+    if not psid:
+        raise gex.AuthError(f"the {used} session has no valid __Secure-1PSID cookie covering gemini.google.com/")
+    c = GeminiClient(psid, psidts)
     jar = Cookies()  # the two session cookies alone make init() time out (measured); the whole Google jar works
-    for ck in cookies: jar.set(ck.name, ck.value, domain=ck.domain, path=ck.path or "/", secure=True)
-    c._cookies = jar
+    for ck in cookies:
+        jar.set(ck.name, ck.value, domain=ck.domain, path=ck.path or "/", secure=True)
+    # Apply full jar via the public setter, then pin the chosen session cookies onto .google.com/ so init() always sends them.
+    c.cookies = jar
+    c._cookies.set("__Secure-1PSID", psid, domain=".google.com", path="/", secure=True)
+    if psidts:
+        c._cookies.set("__Secure-1PSIDTS", psidts, domain=".google.com", path="/", secure=True)
     t = max(90, timeout)  # client request timeout for subsequent generate calls; slower calls raise gemini_webapi.exceptions.TimeoutError
     init_wait = min(90, max(15, timeout))
     try:
@@ -544,12 +1034,33 @@ async def make_client(browser="auto", timeout=90):
     except BaseException:
         await _close_client(c)
         raise
-    from gemini_webapi.constants import AccountStatus
     if c.account_status != AccountStatus.AVAILABLE or not c.access_token:  # expired cookies fall back to a guest session that init() accepts
         await _close_client(c)
-        raise gex.AuthError(f"the {used} session is not logged in to Gemini ({c.account_status.name}); log in again in that browser")
+        hint = "refresh your cookies.json export" if used == "cookies-file" else "log in again in that browser"
+        raise gex.AuthError(f"the {used} session is not logged in to Gemini ({c.account_status.name}); {hint}")
     print(f"gemini_web: session from {used}", file=sys.stderr)
     return c, gex
+
+
+async def make_client(browser="auto", timeout=90, cookies_file=None):
+    used, cookies = load_cookies(browser, cookies_file=cookies_file)
+    try:
+        return await _init_client_from_cookies(used, cookies, timeout)
+    except Exception as e:
+        # If an auto-discovered browser held an expired session and a default cookies.json exists, try that once.
+        if used != "cookies-file" and cookies_file is None and browser == "auto":
+            fallback = default_cookies_file()
+            if fallback.exists() or fallback.is_symlink():
+                try:
+                    import gemini_webapi.exceptions as gex
+                    is_auth = isinstance(e, gex.AuthError)
+                except ImportError:
+                    is_auth = type(e).__name__ == "AuthError"
+                if is_auth:
+                    print(f"gemini_web: {used} session is not logged in, falling back to default cookies.json", file=sys.stderr)
+                    fb_cookies = load_cookies_file(str(fallback))
+                    return await _init_client_from_cookies("cookies-file", fb_cookies, timeout)
+        raise
 
 
 async def _close_client(c) -> None:
@@ -737,6 +1248,16 @@ def _cleanup_empty_dirs(created_dirs: list[Path]) -> None:
             break
 
 
+def _response_videos(r, cand) -> list:
+    vids = getattr(cand, "generated_videos", None) if cand is not None else None
+    if vids:
+        return list(vids)
+    try:
+        return list(getattr(r, "videos", None) or [])
+    except IndexError:
+        return []
+
+
 async def one_call(c, gex, args, prompt, files, resolved_model, out_dir: Path | None = None):
     """One generate call. Returns a dict with status, text, saved paths, detail, err_kind, thoughts, cid, label, note, u0, u1, dur."""
     PATCH["raw"].clear(); PATCH["applied"] = False
@@ -763,9 +1284,15 @@ async def one_call(c, gex, args, prompt, files, resolved_model, out_dir: Path | 
             cand = r.candidates[r.chosen] if getattr(r, "candidates", None) else None
             gen_imgs = list(getattr(cand, "generated_images", None) or [])
             if not gen_imgs:
-                status, detail = _classify_no_media(text, "image")
-                if status == "transient":
-                    text = ""
+                gen_vids = _response_videos(r, cand)
+                if gen_vids:
+                    status = "no_media"
+                    note = "response contained video instead of image; re-run with --mode video"
+                    detail = text[:300] or note
+                else:
+                    status, detail = _classify_no_media(text, "image")
+                    if status == "transient":
+                        text = ""
             else:
                 actual_out_dir, created_dirs = _prepare_media_out_dir(args.mode, out_dir)
                 for idx, img in enumerate(gen_imgs, start=1):
@@ -790,11 +1317,18 @@ async def one_call(c, gex, args, prompt, files, resolved_model, out_dir: Path | 
                 max(1.0, deadline - time.time()),
             )
             text = (r.text or "").strip(); cid = (r.metadata or [None])[0]; thoughts = len(r.thoughts or "")
-            gen_vids = list(getattr(r, "videos", None) or [])
+            cand = r.candidates[r.chosen] if getattr(r, "candidates", None) else None
+            gen_vids = _response_videos(r, cand)
             if not gen_vids:
-                status, detail = _classify_no_media(text, "video")
-                if status == "transient":
-                    text = ""
+                gen_imgs = list(getattr(cand, "generated_images", None) or [])
+                if gen_imgs:
+                    status = "no_media"
+                    note = "response contained image instead of video; re-run with --mode image"
+                    detail = text[:300] or note
+                else:
+                    status, detail = _classify_no_media(text, "video")
+                    if status == "transient":
+                        text = ""
             else:
                 actual_out_dir, created_dirs = _prepare_media_out_dir(args.mode, out_dir)
                 for idx, vid in enumerate(gen_vids, start=1):
@@ -864,7 +1398,7 @@ async def run_list_models(args):
         c = None
         try:
             try:
-                c, _ = await make_client(args.browser, args.timeout)
+                c, _ = await make_client(args.browser, args.timeout, cookies_file=getattr(args, "cookies_file", None))
             except ImportError as e:
                 print(f"gemini_web: missing dependency ({e}); run: pip install -r requirements.txt", file=sys.stderr); return 2
             except Exception as e:
@@ -876,6 +1410,27 @@ async def run_list_models(args):
                 state = "available" if m.is_available else "unavailable"
                 desc = f" | {m.description}" if m.description else ""
                 print(f"{m.model_name}\t{m.display_name}\t{m.model_id}\t{state}{desc}")
+            return 0
+        finally:
+            await _close_client(c)
+
+
+async def run_quota(args):
+    with _isolated_cookie_cache():
+        c = None
+        try:
+            try:
+                c, _ = await make_client(args.browser, args.timeout, cookies_file=getattr(args, "cookies_file", None))
+            except ImportError as e:
+                print(f"gemini_web: missing dependency ({e}); run: pip install -r requirements.txt", file=sys.stderr); return 2
+            except Exception as e:
+                print(f"gemini_web: authentication failed ({type(e).__name__}: {e})", file=sys.stderr); return 2
+            u = await usage(c)
+            if not has_usage_data(u):
+                print("gemini_web: account returned no quota data", file=sys.stderr); return 1
+            print(format_quota(u))
+            for w in quota_warnings(u):
+                print(f"gemini_web: {w}", file=sys.stderr)
             return 0
         finally:
             await _close_client(c)
@@ -897,7 +1452,7 @@ async def run(args, prompt, files, out_dir: Path | None = None, out_file: Path |
         c = None
         try:
             try:
-                c, gex = await make_client(args.browser, args.timeout)
+                c, gex = await make_client(args.browser, args.timeout, cookies_file=getattr(args, "cookies_file", None))
             except ImportError as e:
                 print(f"gemini_web: missing dependency ({e}); run: pip install -r requirements.txt", file=sys.stderr); return 2
             except Exception as e:
@@ -910,12 +1465,19 @@ async def run(args, prompt, files, out_dir: Path | None = None, out_file: Path |
                 return mcode
             u = await usage(c)
             if u["h5"][1] is not None and u["h5"][1] >= 100 - MIN_5H_LEFT_PCT:
-                print(f"gemini_web: 5h window at {u['h5'][1]}% (limit {100 - MIN_5H_LEFT_PCT}%): not calling", file=sys.stderr)
+                print(f"gemini_web: {format_skip_5h(u, 100 - MIN_5H_LEFT_PCT)}", file=sys.stderr)
+                for w in quota_warnings(u, windows=("weekly",)):
+                    print(f"gemini_web: {w}", file=sys.stderr)
                 log(mode=args.mode, model=args.model, effort=args.effort, status="skipped-5h", h5=u["h5"], wk=u["wk"]); return 4
             est, _ = lookup_estimate(args.mode, args.model, args.effort)
             if est and u["h5"][0] is not None and u["h5"][0] < est[1]:
-                print(f"gemini_web: 5h window has {u['h5'][0]} credits left, below estimated {est[0]}-{est[1]}: not calling", file=sys.stderr)
+                print(f"gemini_web: {format_skip_5h_est(u, est)}", file=sys.stderr)
+                for w in quota_warnings(u):
+                    print(f"gemini_web: {w}", file=sys.stderr)
                 log(mode=args.mode, model=args.model, effort=args.effort, status="skipped-5h-est", h5=u["h5"], wk=u["wk"]); return 4
+            for w in quota_warnings(u):
+                print(f"gemini_web: {w}", file=sys.stderr)
+            pre_bands = quota_bands(u)
             if args.mode == "video" and not args.keep:
                 print("gemini_web: video mode saves the conversation in web history (required for polling)", file=sys.stderr)
             for attempt, wait in enumerate(RETRY_WAITS + [None], start=1):
@@ -934,6 +1496,7 @@ async def run(args, prompt, files, out_dir: Path | None = None, out_file: Path |
                     break
                 print(f"gemini_web: {status} on attempt {attempt}, retrying in a new conversation after {wait} s", file=sys.stderr)
                 await asyncio.sleep(wait + random.uniform(0, 5))
+            u_post = merge_usage(merge_usage(u, u0), u1)
             if status == "timeout" and args.mode == "research" and r.get("cid"):
                 print(f"gemini_web: the research did not finish in time; conversation {r['cid']} is kept in the web history, look there later "
                       "(in the one test run it was still unfinished after 26 minutes)", file=sys.stderr)
@@ -941,6 +1504,8 @@ async def run(args, prompt, files, out_dir: Path | None = None, out_file: Path |
                 print(f"gemini_web: {note}", file=sys.stderr)
             if label:
                 print(f"gemini_web: answered by '{label}', {dur}s, 5h credits {u0['h5'][0]}->{u1['h5'][0]}", file=sys.stderr)
+            for w in quota_warnings(u_post, min_band_by_window=pre_bands):
+                print(f"gemini_web: {w}", file=sys.stderr)
             if status == "ok":
                 if args.mode in ("image", "video"):
                     for p in r["saved"]:
@@ -956,7 +1521,10 @@ async def run(args, prompt, files, out_dir: Path | None = None, out_file: Path |
                 else:
                     print(text)
                 return 0
-            print(f"gemini_web: {status}: {(r['detail'] or text)[:300] or note or 'no detail'}", file=sys.stderr)
+            msg_detail = (r["detail"] or text)[:300] or note or "no detail"
+            if status == "limit":
+                msg_detail = format_limit_detail(msg_detail, u_post)
+            print(f"gemini_web: {status}: {msg_detail}", file=sys.stderr)
             return EXIT.get(status, 1)
         finally:
             await _close_client(c)
@@ -1083,9 +1651,15 @@ def selftest():
         check("9-22" in format_estimate("chat", "hydrogen", "high") and "credits=6" in format_estimate("chat", "neon", "low")
               and "credits=880" in format_estimate("video", "carbon", "high")
               and "credits=880" in format_estimate("video", "hydrogen", "high")
-              and "mode baseline" in format_estimate("image", "neon", "high"),
-              "estimate output covers neon low and mode-level video/image fallback")
-        check(lookup_estimate("video", "hydrogen", "high") == ((880, 880), True), "video quota guard fallback applies to default model")
+              and "credits=30" in format_estimate("image", "hydrogen", "high")
+              and "credits=31" in format_estimate("image", "neon", "high")
+              and "credits=3" in format_estimate("image", "gemini-auto", "high")
+              and "mode baseline" in format_estimate("image", "custom-model", "high"),
+              "estimate output covers neon low, measured per-model images, and mode-level video/image fallback")
+        check(lookup_estimate("video", "hydrogen", "high") == ((880, 880), True), "video quota guard fallback applies to unmeasured model")
+        check(default_model_for_mode("chat") == "hydrogen" and default_model_for_mode("research") == "hydrogen"
+              and default_model_for_mode("image") == "carbon" and default_model_for_mode("video") == "carbon",
+              "default model resolves to carbon for image/video and hydrogen for chat/research")
         check(MEDIA_REFUSAL.search("I cannot generate this image due to policy."), "media refusal regex")
         check(CAPABILITY_UNAVAILABLE.search("Video generation is not available on your current plan."), "capability unavailable regex")
         check(not retryable("no_media") and not retryable("unsupported") and not retryable("download_error") and EXIT["unsupported"] == 6, "media retry/exit rules")
@@ -1094,21 +1668,98 @@ def selftest():
         check("effort=n/a" in format_estimate("image", "gemini-carbon", "high") and "9-22" in format_estimate("chat", "gemini-4-hydrogen", "high"),
               "estimate: full model names find the row, effort only shown for chat")
 
-        ns = lambda **kw: argparse.Namespace(**{**dict(mode="chat", model="hydrogen", effort=None, files=[], ref=[], confirm_apps_off=False,
-                                                        output=None, output_dir=None, timeout=600), **kw})
-        check(validate_args(ns(mode="image", ref=["a.png"], output_dir="out"))[0] == 0, "valid image args")
-        check(validate_args(ns(mode="video", ref=["a.png"]))[0] == 0, "valid video args")
+        ns = lambda **kw: argparse.Namespace(**{**dict(mode="chat", model=None, effort=None, files=[], ref=[], confirm_apps_off=False,
+                                                        output=None, output_dir=None, aspect=None, prompt=None, prompt_file=None, timeout=600), **kw})
+        check(validate_args(ns(mode="image", ref=["a.png"], output_dir="out", aspect="16:9"))[0] == 0, "valid image args with aspect")
+        check(validate_args(ns(mode="video", ref=["a.png"], aspect="9:16"))[0] == 0, "valid video args with aspect")
         check(validate_args(ns(mode="image", files=["a.txt"]))[0] == 2, "image refuses --files")
         check(validate_args(ns(mode="image", output="x.png"))[0] == 2, "image refuses --output")
         check(validate_args(ns(mode="image", effort="low"))[0] == 2, "image refuses --effort")
         check(validate_args(ns(mode="video", ref=["a.png", "b.png"]))[0] == 2, "video refuses >1 --ref")
         check(validate_args(ns(mode="chat", ref=["a.png"]))[0] == 2, "chat refuses --ref")
         check(validate_args(ns(mode="chat", output_dir="out"))[0] == 2, "chat refuses --output-dir")
+        check(validate_args(ns(mode="chat", aspect="16:9"))[0] == 2, "chat refuses --aspect")
+        check(validate_args(ns(mode="research", aspect="16:9"))[0] == 2, "research refuses --aspect")
+        check(validate_args(ns(mode="chat", model=""))[0] == 2, "empty --model refused")
+        check(validate_args(ns(mode="chat", prompt="hi", prompt_file="p.txt"))[0] == 2, "--prompt and --prompt-file mutually exclusive")
+        check(validate_args(ns(mode="chat", prompt="", prompt_file="p.txt"))[0] == 2, "empty --prompt with --prompt-file still refused")
+        check(validate_args(ns(mode="chat", prompt_file="   "))[0] == 2, "blank --prompt-file refused")
         check(validate_args(ns(mode="tasks"))[0] == 7 and validate_args(ns(mode="tasks", confirm_apps_off=True))[0] == 6, "tasks guards")
         check(validate_args(ns(timeout=0))[0] == 2, "non-positive timeout refused")
 
+        # --aspect boundary checks
+        for good_ar, norm_ar in (("16:9", "16:9"), ("4:5", "4:5"), ("1:1", "1:1"), ("21:9", "21:9"), ("1:99", "1:99"), ("99:1", "99:1"), ("01:09", "1:9")):
+            check(validate_aspect(good_ar) == norm_ar, f"valid aspect {good_ar}")
+        for bad_ar in ("", "0:9", "9:0", "00:00", "100:50", "16:100", "-16:9", "16/9", "16:9:1", "wide", "16:9\n", " 16:9"):
+            check(validate_args(ns(mode="image", aspect=bad_ar))[0] == 2, f"invalid aspect {bad_ar!r} refused")
+
+        # --prompt-file boundary and security checks
+        pf_ok = t / "prompt_ok.txt"; pf_ok.write_text("Generate a ceramic bowl", encoding="utf-8")
+        pf_max = t / "prompt_max.txt"; pf_max.write_bytes(b"a" * MAX_PROMPT_FILE_BYTES)
+        pf_over = t / "prompt_over.txt"; pf_over.write_bytes(b"a" * (MAX_PROMPT_FILE_BYTES + 1))
+        pf_ws = t / "prompt_ws.txt"; pf_ws.write_text("  \n\t ", encoding="utf-8")
+        pf_bin = t / "prompt_bin.txt"; pf_bin.write_bytes(b"\xff\xfe\xfd")
+        pf_link = t / "prompt_link.txt"; pf_link.symlink_to(pf_ok)
+        pf_json = t / "scene.json"; pf_json.write_text('{"subject": "ceramic bowl", "lighting": "soft left"}', encoding="utf-8")
+        check(read_prompt_file(str(pf_ok)) == "Generate a ceramic bowl", "valid prompt-file accepted")
+        check(len(read_prompt_file(str(pf_max))) == MAX_PROMPT_FILE_BYTES, "exact MAX_PROMPT_FILE_BYTES accepted")
+        for bad_pf, what in (
+            (t / "e.txt", "empty prompt-file"),
+            (pf_ws, "whitespace-only prompt-file"),
+            (pf_over, "oversized prompt-file"),
+            (pf_bin, "invalid UTF-8 prompt-file"),
+            (pf_link, "symlink prompt-file"),
+            (t / "viapai" / "n.txt", "symlinked parent prompt-file"),
+            (t / "viapai" / ".." / "prompt_ok.txt", "symlink + .. bypass prompt-file"),
+            (t, "directory prompt-file"),
+            (t / "does_not_exist.txt", "missing prompt-file"),
+        ):
+            try: read_prompt_file(str(bad_pf)); check(False, f"{what} refused")
+            except ValueError: ok += 1
+
+        # prepare_prompt: plain text + aspect, structured JSON in media vs chat
+        json_txt = read_prompt_file(str(pf_json))
+        prep_img_json = prepare_prompt(json_txt, "image")
+        prep_img_json_ar = prepare_prompt(json_txt, "image", aspect="16:9")
+        prep_vid_ar = prepare_prompt("Generate a short video of rain.", "video", aspect="9:16")
+        prep_chat_json = prepare_prompt(json_txt, "chat", aspect="16:9")
+        check(prep_img_json.startswith("Generate the image described by the following JSON specification.") and json_txt in prep_img_json,
+              "JSON prompt in image mode gets media directive prefix")
+        check("16:9 aspect ratio" in prep_img_json_ar and json_txt in prep_img_json_ar, "JSON prompt + --aspect combined cleanly")
+        check(prep_vid_ar.startswith("Generate a short video of rain.") and "9:16" in prep_vid_ar, "plain text + --aspect preserves opening verb")
+        check(prep_chat_json == json_txt, "chat mode leaves JSON prompt unchanged")
+        check(prepare_prompt("{not json", "image") == "{not json" and prepare_prompt("42", "image") == "42",
+              "invalid JSON and JSON scalar are not wrapped as structured JSON")
+        check(is_structured_json('[{"scene": 1}]') and not is_structured_json('"just a string"'), "structured JSON only matches object/array")
+        # DeepSeek review regressions: deep JSON nesting, UTF-8 BOM JSON/empty, openat nofollow, distinct --output/--prompt-file
+        check(not is_structured_json("[" * 100000 + "]" * 100000), "deeply nested JSON returns False instead of RecursionError")
+        bom_json = '\ufeff{"subject": "mug"}'
+        check(is_structured_json(bom_json) and prepare_prompt(bom_json, "image").startswith("Generate the image") and "\ufeff" not in prepare_prompt(bom_json, "image"),
+              "UTF-8 BOM JSON is recognized and stripped cleanly")
+        pf_bom_empty = t / "bom_empty.txt"; pf_bom_empty.write_text("\ufeff  \n", encoding="utf-8")
+        try: read_prompt_file(str(pf_bom_empty)); check(False, "BOM-only prompt-file refused")
+        except ValueError: ok += 1
+        fd_ok = _open_regular_nofollow(pf_ok.resolve())
+        os.close(fd_ok); ok += 1
+        try: os.close(_open_regular_nofollow(t / "viapai" / "n.txt")); check(False, "openat rejects symlinked parent")
+        except OSError: ok += 1
+        try: os.close(_open_regular_nofollow(pf_link)); check(False, "openat rejects leaf symlink")
+        except OSError: ok += 1
+        try: check_distinct_output_and_prompt(pf_ok.resolve(), str(pf_ok)); check(False, "same --output and --prompt-file refused")
+        except ValueError: ok += 1
+        pf_hardlink = t / "prompt_hl.txt"
+        try:
+            os.link(pf_ok, pf_hardlink)
+            try: check_distinct_output_and_prompt(pf_hardlink.resolve(), str(pf_ok)); check(False, "hardlink --output to --prompt-file refused")
+            except ValueError: ok += 1
+        except OSError:
+            ok += 1  # filesystems without hard links
+        check_distinct_output_and_prompt((t / "distinct_out.txt").resolve(), str(pf_ok)); ok += 1
+
         (base / "dangling").symlink_to(base / "nowhere")
         try: check_output_dir(str(base / "dangling" / "out")); check(False, "dangling symlink refused")
+        except ValueError: ok += 1
+        try: read_prompt_file(str(base / "dangling" / "p.txt")); check(False, "dangling symlink prompt-file refused")
         except ValueError: ok += 1
         src1 = base / "a.tmp"; src1.write_bytes(b"1"); src2 = base / "b.tmp"; src2.write_bytes(b"2")
         p1 = place_unique(src1, d1, "image", ".png"); p2 = place_unique(src2, d1, "image", ".png")
@@ -1137,14 +1788,309 @@ def selftest():
             async def generate_content(self, *a, **k):
                 cand = argparse.Namespace(generated_images=[_FakeImg(False), _FakeImg(True)])
                 return argparse.Namespace(text="", metadata=["c_partial"], thoughts="", candidates=[cand], chosen=0)
+        try:
+            from gemini_webapi.exceptions import AuthError as _AuthErrBase
+        except ImportError:
+            _AuthErrBase = Exception
         class _FakeGex:
             class TimeoutError(Exception): pass
             class UsageLimitExceededError(Exception): pass
-            class AuthError(Exception): pass
+            class AuthError(_AuthErrBase): pass
         part_dir = base / "partial_imgs"
         part_res = asyncio.run(one_call(_FakeClient(), _FakeGex, ns(mode="image", model="carbon", keep=False), "draw", [], "gemini-carbon", out_dir=part_dir))
         check(part_res["status"] == "download_error" and len(part_res["saved"]) == 1 and part_res["saved"][0] in part_res["note"],
               "partial multi-image download preserves and reports saved file in note")
+
+        # Cross-mode swapped media detection (image gets video; video gets image; empty falls back to text classification)
+        class _SwapToVideoClient(_FakeClient):
+            async def generate_content(self, *a, **k):
+                cand = argparse.Namespace(generated_images=[], generated_videos=[object()])
+                return argparse.Namespace(text="", metadata=["c_swap1"], thoughts="", candidates=[cand], chosen=0, videos=[object()])
+        class _SwapToImageClient(_FakeClient):
+            async def generate_content(self, *a, **k):
+                cand = argparse.Namespace(generated_images=[_FakeImg(False)], generated_videos=[])
+                return argparse.Namespace(text="", metadata=["c_swap2"], thoughts="", candidates=[cand], chosen=0, videos=[])
+        class _NoMediaRefusalClient(_FakeClient):
+            async def generate_content(self, *a, **k):
+                cand = argparse.Namespace(generated_images=[], generated_videos=[])
+                return argparse.Namespace(text="I cannot generate this image due to policy.", metadata=["c_ref"], thoughts="", candidates=[cand], chosen=0, videos=[])
+        swap_dir1 = base / "swap_v"
+        swap_r1 = asyncio.run(one_call(_SwapToVideoClient(), _FakeGex, ns(mode="image", model="carbon", keep=False), "draw", [], "gemini-carbon", out_dir=swap_dir1))
+        check(swap_r1["status"] == "no_media" and "--mode video" in swap_r1["note"] and not swap_dir1.exists(),
+              "image mode receiving video reports swapped-mode hint without creating output dir")
+        swap_dir2 = base / "swap_i"
+        swap_r2 = asyncio.run(one_call(_SwapToImageClient(), _FakeGex, ns(mode="video", model="carbon", keep=False), "animate", [], "gemini-carbon", out_dir=swap_dir2))
+        check(swap_r2["status"] == "no_media" and "--mode image" in swap_r2["note"] and not swap_dir2.exists(),
+              "video mode receiving image reports swapped-mode hint without creating output dir")
+        ref_r = asyncio.run(one_call(_NoMediaRefusalClient(), _FakeGex, ns(mode="image", model="carbon", keep=False), "draw", [], "gemini-carbon", out_dir=base / "no_m"))
+        check(ref_r["status"] == "refused", "empty media without swapped asset still classifies text refusal")
+
+        # Usage parsing, --quota formatting, threshold warnings, and exit 4 reset hints
+        sample_ui = {
+            "tier": {"id": 2, "label": "PRO"},
+            "current_5h": {"remaining_credits": 1452, "usage_percentage": 39, "reset_at": "2026-11-25T00:29:18-03:00"},
+            "weekly": {"remaining_credits": 40717, "usage_percentage": 16, "reset_at": "2026-11-25T11:29:18-03:00"},
+            "ai_credits_remaining": 120,
+        }
+        parsed = parse_usage_info(sample_ui)
+        check(has_usage_data(parsed) and parsed["tier"] == "PRO" and parsed["h5"] == [1452, 39] and parsed["ai_credits"] == 120
+              and parsed["h5_reset"] == "2026-11-25T00:29:18-03:00", "parse_usage_info extracts full fields")
+        fq = format_quota(parsed)
+        check("tier: PRO" in fq and "5h: 1452 credits left, 39% used, resets 2026-11-25T00:29-03:00" in fq
+              and "weekly: 40717 credits left, 16% used, resets 2026-11-25T11:29-03:00" in fq and "ai_credits: 120 left" in fq,
+              "format_quota produces stable full output")
+        empty_u = parse_usage_info({})
+        tier_only_u = parse_usage_info({"tier": {"id": 9, "label": None}})
+        check(not has_usage_data(empty_u) and not has_usage_data(tier_only_u) and tier_only_u["tier"] == "tier-9",
+              "has_usage_data rejects empty and tier-only usage_info")
+        partial_u = parse_usage_info({"current_5h": {"remaining_credits": 50, "usage_percentage": 80, "reset_at": None}})
+        fq_part = format_quota(partial_u)
+        check("tier:" not in fq_part and "resets" not in fq_part and "ai_credits:" not in fq_part and "5h: 50 credits left, 80% used" in fq_part,
+              "format_quota degrades cleanly when tier/reset_at/ai_credits are absent")
+        for pct, expected in ((49, None), (50, "notice (>=50%)"), (74, "notice (>=50%)"), (75, "high (>=75%)"), (89, "high (>=75%)"), (90, "critical (>=90%)"), (100, "critical (>=90%)")):
+            w_list = quota_warnings({"h5": [100, pct], "wk": [5000, 10], "h5_reset": "2026-11-25T00:29:18-03:00", "wk_reset": None})
+            if expected is None:
+                check(w_list == [], f"no quota warning at {pct}%")
+            else:
+                check(len(w_list) == 1 and expected in w_list[0] and "2026-11-25T00:29-03:00" in w_list[0], f"quota warning band {expected} at {pct}%")
+        both_w = quota_warnings({"h5": [100, 75], "wk": [200, 92], "h5_reset": None, "wk_reset": "2026-11-30T11:29:00-03:00"})
+        check(len(both_w) == 2 and "5h window at 75%" in both_w[0] and "resets" not in both_w[0]
+              and "weekly window at 92%" in both_w[1] and "2026-11-30T11:29-03:00" in both_w[1],
+              "quota_warnings emits deterministic warnings for both windows and degrades without reset_at")
+        check(quota_warnings({"h5": [100, True], "wk": [100, None]}) == [], "quota_warnings ignores non-numeric/bool pct")
+        pre_b = quota_bands({"h5": [400, 60], "wk": [5000, 10]})
+        check(pre_b == {"5h": 50} and quota_warnings({"h5": [380, 62], "wk": [4980, 10]}, min_band_by_window=pre_b) == [],
+              "same-band post-call usage does not emit duplicate warning")
+        esc_w = quota_warnings({"h5": [200, 76], "wk": [4000, 50]}, min_band_by_window=pre_b)
+        check(len(esc_w) == 2 and "high (>=75%)" in esc_w[0] and "notice (>=50%)" in esc_w[1],
+              "escalated or newly crossed post-call bands emit warnings")
+        check("resets 2026-11-25T00:29-03:00" in format_skip_5h(parsed, 90) and "resets" not in format_skip_5h(partial_u, 90),
+              "skipped-5h includes reset_at when present and degrades cleanly")
+        check("resets 2026-11-25T00:29-03:00" in format_skip_5h_est(parsed, (880, 880)) and "resets" not in format_skip_5h_est(partial_u, (880, 880)),
+              "skipped-5h-est includes reset_at when present and degrades cleanly")
+        lim_msg = format_limit_detail("Usage limit exceeded", parsed)
+        check("5h resets 2026-11-25T00:29-03:00" in lim_msg and "weekly resets 2026-11-25T11:29-03:00" in lim_msg
+              and format_limit_detail("Usage limit exceeded", partial_u) == "Usage limit exceeded",
+              "limit detail appends reset_at for both windows when available")
+        merged_u = merge_usage(parsed, empty_u)
+        check(merged_u == parsed, "merge_usage falls back to u0 when post-call u1 is empty")
+        merged_part = merge_usage(parsed, partial_u)
+        check(merged_part["h5"] == [50, 80] and merged_part["h5_reset"] == "2026-11-25T00:29:18-03:00" and merged_part["wk"] == [40717, 16],
+              "merge_usage preserves missing reset_at and window metrics from u0")
+        u_pre_hi = {"h5": [100, 80], "wk": [1000, 20], "h5_reset": "2026-11-25T00:29:18-03:00", "wk_reset": None, "tier": "PRO", "ai_credits": None}
+        u_post_partial = {"h5": [50, None], "wk": [950, None], "h5_reset": None, "wk_reset": None, "tier": None, "ai_credits": None}
+        merged_pf = merge_usage(u_pre_hi, u_post_partial)
+        check(merged_pf["h5"] == [50, 80] and merged_pf["wk"] == [950, 20] and len(quota_warnings(merged_pf)) == 1,
+              "merge_usage falls back per field so partial post-call h5 keeps pre-call percentage for warnings")
+
+        # Direct run_quota entry-point tests: exit 0/1/2, client close, cookies_file forwarding, and isolated cookie cache cleanup
+        import io
+        orig_make_client = make_client
+        q_args = argparse.Namespace(browser="auto", timeout=30, cookies_file=None)
+        try:
+            class _QuotaFakeClient:
+                def __init__(self, ui):
+                    self.usage_info = ui
+                    self.closed = False
+                    self.cookie_dir = os.environ.get("GEMINI_COOKIE_PATH")
+                async def _fetch_quota(self): pass
+                async def _fetch_usage_info(self): pass
+                async def close(self): self.closed = True
+
+            # exit 0 with data + stderr threshold warning + cookies_file forwarded
+            fc0 = _QuotaFakeClient({
+                "tier": {"id": 2, "label": "PRO"},
+                "current_5h": {"remaining_credits": 250, "usage_percentage": 75, "reset_at": "2026-11-25T00:29:18-03:00"},
+                "weekly": {"remaining_credits": 20000, "usage_percentage": 20, "reset_at": "2026-11-25T11:29:18-03:00"},
+            })
+            seen_cf = []
+            async def _mk0(browser="auto", timeout=90, cookies_file=None):
+                fc0.cookie_dir = os.environ.get("GEMINI_COOKIE_PATH")
+                seen_cf.append(cookies_file)
+                return fc0, _FakeGex
+            globals()["make_client"] = _mk0
+            out0, err0 = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out0), contextlib.redirect_stderr(err0):
+                rc0 = asyncio.run(run_quota(argparse.Namespace(browser="auto", timeout=30, cookies_file="/tmp/c.json")))
+            check(rc0 == 0 and seen_cf == ["/tmp/c.json"] and "tier: PRO" in out0.getvalue() and "5h: 250 credits left, 75% used" in out0.getvalue()
+                  and "quota high (>=75%)" in err0.getvalue() and fc0.closed and fc0.cookie_dir and not Path(fc0.cookie_dir).exists(),
+                  "run_quota returns 0 with data, forwards cookies_file, warns on stderr, closes client, and wipes isolated cookie dir")
+
+            # exit 1 on empty usage_info
+            fc1 = _QuotaFakeClient({})
+            async def _mk1(browser="auto", timeout=90, cookies_file=None):
+                fc1.cookie_dir = os.environ.get("GEMINI_COOKIE_PATH")
+                return fc1, _FakeGex
+            globals()["make_client"] = _mk1
+            out1, err1 = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out1), contextlib.redirect_stderr(err1):
+                rc1 = asyncio.run(run_quota(q_args))
+            check(rc1 == 1 and out1.getvalue() == "" and "no quota data" in err1.getvalue() and fc1.closed and not Path(fc1.cookie_dir).exists(),
+                  "run_quota returns 1 on empty data, closes client, and wipes cookie dir")
+
+            # exit 2 on ImportError and auth error
+            async def _mk_imp(browser="auto", timeout=90, cookies_file=None): raise ImportError("no pkg")
+            globals()["make_client"] = _mk_imp
+            err_imp = io.StringIO()
+            with contextlib.redirect_stderr(err_imp):
+                rc_imp = asyncio.run(run_quota(q_args))
+            check(rc_imp == 2 and "missing dependency" in err_imp.getvalue(), "run_quota returns 2 on ImportError")
+
+            async def _mk_auth(browser="auto", timeout=90, cookies_file=None): raise RuntimeError("no logged-in browser")
+            globals()["make_client"] = _mk_auth
+            err_auth = io.StringIO()
+            with contextlib.redirect_stderr(err_auth):
+                rc_auth = asyncio.run(run_quota(q_args))
+            check(rc_auth == 2 and "authentication failed" in err_auth.getvalue(), "run_quota returns 2 on auth failure")
+        finally:
+            globals()["make_client"] = orig_make_client
+
+        # cookies.json support: domain filtering, formats, permissions, symlink/TOCTOU, size, BOM, fallback, and leak-free errors
+        for good_dom in (".google.com", "google.com", "gemini.google.com", ".gemini.google.com", "accounts.google.com"):
+            check(_is_google_cookie_domain(good_dom), f"google cookie domain accepted: {good_dom}")
+        for bad_dom in ("", "evilgoogle.com", "google.com.evil.org", "github.com", "..google.com", "google.com.", "google.com\n"):
+            check(not _is_google_cookie_domain(bad_dom), f"non-google cookie domain rejected: {bad_dom!r}")
+        check(validate_args(ns(cookies_file=""))[0] == 2 and validate_args(ns(cookies_file="   "))[0] == 2,
+              "empty --cookies-file refused")
+
+        ck_list = t / "cookies_list.json"
+        ck_list.write_text(json.dumps([
+            {"name": "__Secure-1PSID", "value": "psid-tok-123", "domain": ".google.com", "path": "/"},
+            {"name": "__Secure-1PSIDTS", "value": "psidts-tok-456", "domain": "gemini.google.com", "path": "/"},
+            {"name": "SESSION", "value": "bank-secret", "domain": "mybank.example", "path": "/"},
+            {"name": "OTHER", "value": "spoof", "domain": "evilgoogle.com", "path": "/"},
+        ]), encoding="utf-8")
+        os.chmod(ck_list, 0o600)
+        loaded_list = load_cookies_file(str(ck_list))
+        check(len(loaded_list) == 2 and {c.name for c in loaded_list} == {"__Secure-1PSID", "__Secure-1PSIDTS"}
+              and all(c.value != "bank-secret" and c.value != "spoof" for c in loaded_list),
+              "cookies.json list filters strictly to google.com and drops unrelated domains")
+
+        # Session-cookie coverage checks (domain + path must cover https://gemini.google.com/)
+        check(_covers_gemini_root(".google.com", "/") and _covers_gemini_root("gemini.google.com", "/")
+              and not _covers_gemini_root("accounts.google.com", "/") and not _covers_gemini_root("gemini.google.com", "/app"),
+              "session cookie root coverage accepts .google.com/ and gemini.google.com/ only")
+        for bad_scope, what in (
+            ([{"name": "__Secure-1PSID", "value": "x", "domain": "accounts.google.com", "path": "/"}], "accounts.google.com only __Secure-1PSID"),
+            ([{"name": "__Secure-1PSID", "value": "x", "domain": "gemini.google.com", "path": "/app"}], "/app-scoped __Secure-1PSID"),
+        ):
+            try: _parse_cookies_payload(bad_scope); check(False, f"{what} refused")
+            except ValueError: ok += 1
+        sel_psid, sel_ts = select_session_cookies([
+            argparse.Namespace(name="__Secure-1PSID", value="good-root", domain=".google.com", path="/"),
+            argparse.Namespace(name="__Secure-1PSID", value="decoy-acct", domain="accounts.google.com", path="/"),
+            argparse.Namespace(name="__Secure-1PSIDTS", value="decoy-app", domain="gemini.google.com", path="/app"),
+            argparse.Namespace(name="__Secure-1PSIDTS", value="good-ts", domain=".google.com", path="/"),
+        ])
+        check(sel_psid == "good-root" and sel_ts == "good-ts",
+              "select_session_cookies picks .google.com/ over accounts.google.com or /app decoys")
+
+        ck_wrap = t / "cookies_wrap.json"
+        ck_wrap.write_text('\ufeff{"cookies": [{"name": "__Secure-1PSID", "value": "bom-tok", "domain": ".google.com"}]}', encoding="utf-8")
+        os.chmod(ck_wrap, 0o600)
+        check(load_cookies_file(str(ck_wrap))[0].value == "bom-tok", "cookies.json wrapper with UTF-8 BOM accepted")
+
+        ck_flat = t / "cookies_flat.json"
+        ck_flat.write_text('{"__Secure-1PSID": "flat-tok", "__Secure-1PSIDTS": "flat-ts"}', encoding="utf-8")
+        os.chmod(ck_flat, 0o600)
+        loaded_flat = load_cookies_file(str(ck_flat))
+        check(len(loaded_flat) == 2 and loaded_flat[0].domain == ".google.com", "flat dict cookies.json accepted")
+
+        # Permission, symlink, size, schema, and zero-leak checks
+        if os.name == "posix":
+            ck_open = t / "cookies_open.json"
+            ck_open.write_text('{"__Secure-1PSID": "tok"}', encoding="utf-8")
+            os.chmod(ck_open, 0o644)
+            try: load_cookies_file(str(ck_open)); check(False, "mode 0644 cookies.json refused")
+            except ValueError as e: check("chmod 600" in str(e) and "tok" not in str(e), "mode 0644 error advises chmod 600 without leaking value")
+
+        ck_link = t / "cookies_link.json"; ck_link.symlink_to(ck_list)
+        ck_empty = t / "cookies_empty.json"; ck_empty.write_bytes(b""); os.chmod(ck_empty, 0o600)
+        ck_big = t / "cookies_big.json"; ck_big.write_bytes(b" " * (MAX_COOKIES_FILE_BYTES + 1)); os.chmod(ck_big, 0o600)
+        ck_bad_utf8 = t / "cookies_bin.json"; ck_bad_utf8.write_bytes(b"\xff\xfe"); os.chmod(ck_bad_utf8, 0o600)
+        ck_bad_json = t / "cookies_bad.json"; ck_bad_json.write_text("{SECRET_CANARY_999", encoding="utf-8"); os.chmod(ck_bad_json, 0o600)
+        ck_nested = t / "cookies_nested.json"; ck_nested.write_text("[" * 100000 + "]" * 100000, encoding="utf-8"); os.chmod(ck_nested, 0o600)
+        ck_no_psid = t / "cookies_nopsid.json"; ck_no_psid.write_text('{"NID": "SECRET_CANARY_999"}', encoding="utf-8"); os.chmod(ck_no_psid, 0o600)
+        ck_crlf = t / "cookies_crlf.json"; ck_crlf.write_text('{"__Secure-1PSID": "a\\r\\nb"}', encoding="utf-8"); os.chmod(ck_crlf, 0o600)
+        for bad_ck, what in (
+            (ck_link, "symlink cookies.json"),
+            (t / "viapai" / "n.txt", "symlinked parent cookies.json"),
+            (t / "viapai" / ".." / "cookies_list.json", "symlink + .. bypass cookies.json"),
+            (t, "directory cookies.json"),
+            (t / "missing_cookies.json", "missing cookies.json"),
+            (ck_empty, "empty cookies.json"),
+            (ck_big, "oversized cookies.json"),
+            (ck_bad_utf8, "invalid UTF-8 cookies.json"),
+            (ck_bad_json, "invalid JSON cookies.json"),
+            (ck_nested, "deeply nested cookies.json"),
+            (ck_no_psid, "missing __Secure-1PSID cookies.json"),
+            (ck_crlf, "CRLF injection cookies.json"),
+        ):
+            try: load_cookies_file(str(bad_ck)); check(False, f"{what} refused")
+            except ValueError as e:
+                check("SECRET_CANARY_999" not in str(e), f"{what} refused without leaking secret values")
+
+        # load_cookies explicit path + default XDG_DATA_HOME fallback + missing-default-path guard + stale-browser AuthError fallback
+        src_explicit, cks_explicit = load_cookies("edge", cookies_file=str(ck_list))
+        check(src_explicit == "cookies-file" and len(cks_explicit) == 2, "explicit cookies_file overrides browser")
+        prev_xdg = os.environ.get("XDG_DATA_HOME")
+        prev_bc3 = sys.modules.get("browser_cookie3")
+        orig_load_ck = load_cookies
+        orig_init_ck = _init_client_from_cookies
+        try:
+            xdg_dir = base / "xdg_ck"
+            (xdg_dir / "gemini-web").mkdir(parents=True, mode=0o700)
+            fb_file = xdg_dir / "gemini-web" / "cookies.json"
+            os.environ["XDG_DATA_HOME"] = str(xdg_dir)
+            # Guard rejects --output and --output-dir pointing at default cookies.json even BEFORE it exists
+            for lbl in ("--output", "--output-dir"):
+                try: _refuse_same_as_default_cookies(fb_file, lbl); check(False, f"missing default cookies.json refused for {lbl}")
+                except ValueError: ok += 1
+            fb_file.write_text('{"__Secure-1PSID": "fallback-tok"}', encoding="utf-8")
+            os.chmod(fb_file, 0o600)
+            sys.modules["browser_cookie3"] = None  # simulate missing browser-cookie3 (e.g. Windows without decryption)
+            src_fb, cks_fb = load_cookies("auto")
+            check(src_fb == "cookies-file" and cks_fb[0].value == "fallback-tok", "default cookies.json fallback works when browser extraction unavailable")
+            # Stale browser jar returning AuthError under browser="auto" retries once with default cookies.json
+            calls_seen = []
+            def _fake_load_stale(browser="auto", cookies_file=None):
+                return "edge", [argparse.Namespace(name="__Secure-1PSID", value="stale", domain=".google.com", path="/")]
+            async def _fake_init_stale(used, cookies, timeout):
+                calls_seen.append(used)
+                if used == "edge":
+                    raise _FakeGex.AuthError("stale edge session")
+                return "ok-client", _FakeGex
+            globals()["load_cookies"] = _fake_load_stale
+            globals()["_init_client_from_cookies"] = _fake_init_stale
+            with contextlib.redirect_stderr(io.StringIO()):
+                mc_c, _ = asyncio.run(make_client("auto", 30, cookies_file=None))
+            check(mc_c == "ok-client" and calls_seen == ["edge", "cookies-file"],
+                  "stale auto browser AuthError falls back once to default cookies.json")
+            calls_seen.clear()
+            try:
+                asyncio.run(make_client("edge", 30, cookies_file=None))
+                check(False, "explicit --browser edge does not fall back to default cookies.json")
+            except _FakeGex.AuthError:
+                check(calls_seen == ["edge"], "explicit --browser edge raises AuthError without fallback")
+            globals()["load_cookies"] = orig_load_ck
+            globals()["_init_client_from_cookies"] = orig_init_ck
+            fb_file.unlink()
+            fb_file.symlink_to(ck_list)
+            try: load_cookies("auto"); check(False, "planted symlink at default cookies.json refused")
+            except ValueError: ok += 1
+        finally:
+            globals()["load_cookies"] = orig_load_ck
+            globals()["_init_client_from_cookies"] = orig_init_ck
+            if prev_xdg is None: os.environ.pop("XDG_DATA_HOME", None)
+            else: os.environ["XDG_DATA_HOME"] = prev_xdg
+            if prev_bc3 is None: sys.modules.pop("browser_cookie3", None)
+            else: sys.modules["browser_cookie3"] = prev_bc3
+
+        try: check_not_same_file(ck_list.resolve(), str(ck_list), "--output", "--cookies-file"); check(False, "--output == --cookies-file refused")
+        except ValueError: ok += 1
+        try: check_not_same_file(ck_list.resolve(), str(ck_list), "--files", "--cookies-file"); check(False, "--files == --cookies-file refused")
+        except ValueError: ok += 1
+
         # _safe_file_bytes ignores a vanished file instead of crashing
         gone = base / "vanished.txt"; gone.write_bytes(b"abcd")
         check(_safe_file_bytes([str(gone)]) == 4, "safe file bytes reads existing file")
@@ -1164,11 +2110,28 @@ def selftest():
     print(f"selftest: {ok} checks passed")
 
 
+def _refuse_same_as_default_cookies(target: Path, label: str) -> None:
+    """Prevents --output, --output-dir, --prompt-file, or --files from targeting the default cookies.json path (existing or not)."""
+    fb = default_cookies_file()
+    if Path(os.path.abspath(target)) == Path(os.path.abspath(fb)):
+        raise ValueError(f"{label} ({target}) must not target the default cookies.json path")
+    try:
+        if target.resolve() == fb.resolve():
+            raise ValueError(f"{label} ({target}) must not target the default cookies.json path")
+    except OSError:
+        pass
+    try:
+        if target.exists() and fb.exists() and os.path.samefile(target, fb):
+            raise ValueError(f"{label} ({target}) must not refer to the default cookies.json")
+    except OSError:
+        pass
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--mode", choices=["chat", "tasks", "research", "image", "video"], default="chat")
-    p.add_argument("--model", default="hydrogen",
-                   help="model alias (hydrogen, neon, carbon) or any model name/id shown by --list-models")
+    p.add_argument("--model", default=None,
+                   help="model alias (hydrogen, neon, carbon) or any model name/id shown by --list-models (default: carbon for image/video, hydrogen for chat/research)")
     p.add_argument("--effort", choices=list(LEVEL), default=None,
                    help="thinking level for chat mode (default: high); low is Baixo, high is Alto")
     p.add_argument("--keep", action="store_true",
@@ -1176,58 +2139,115 @@ def main():
     p.add_argument("--files", nargs="+", default=[], help="regular files to attach (chat only; empty files and links are refused)")
     p.add_argument("--ref", nargs="+", default=[],
                    help="reference image files for image/video modes (regular non-empty PNG, JPEG, WebP or GIF only)")
+    p.add_argument("--aspect", default=None,
+                   help="target aspect ratio W:H for image/video modes (e.g. 16:9, 4:5, 1:1)")
     p.add_argument("--confirm-apps-off", action="store_true", help="required by tasks: you assert connected apps and the browser are off")
     p.add_argument("--output", help="write the text reply here (mode 600) instead of stdout (chat/research only)")
     p.add_argument("--output-dir", help="folder for saved images or video (default: new folder in current directory)")
     p.add_argument("--prompt", help="prompt text; default: read stdin")
+    p.add_argument("--prompt-file", help="read prompt from a regular UTF-8 file (mutually exclusive with --prompt; JSON auto-prefixed in image/video)")
     p.add_argument("--timeout", type=int, default=600)
     p.add_argument("--browser", default=os.environ.get("GEMINI_WEB_BROWSER", "auto"), choices=["auto"] + BROWSERS,
                    help="browser whose Google session to use (default: the first one found logged in)")
+    p.add_argument("--cookies-file", default=None,
+                   help="private JSON file with Google cookies (mode 0600 on POSIX; overrides --browser; env: GEMINI_WEB_COOKIES_FILE)")
     p.add_argument("--list-models", action="store_true", help="list models available on this account and exit")
+    p.add_argument("--quota", action="store_true", help="print 5h and weekly quota balance without spending credits and exit")
     p.add_argument("--estimate", action="store_true", help="print expected credit range for the chosen settings and exit")
     p.add_argument("--selftest", action="store_true")
     args = p.parse_args()
     if args.selftest:
         return selftest()
+    if args.cookies_file is not None and not str(args.cookies_file).strip():
+        print("gemini_web: --cookies-file must not be empty", file=sys.stderr); sys.exit(2)
+    if args.cookies_file is None:
+        env_ck = os.environ.get("GEMINI_WEB_COOKIES_FILE")
+        if env_ck is not None and env_ck.strip():
+            args.cookies_file = env_ck
+    if args.list_models and args.quota:
+        print("gemini_web: pass either --list-models or --quota, not both", file=sys.stderr); sys.exit(2)
+    if args.list_models or args.quota:
+        if args.timeout <= 0:
+            print("gemini_web: --timeout must be a positive integer", file=sys.stderr); sys.exit(2)
+        if args.cookies_file is not None:
+            try:
+                load_cookies_file(args.cookies_file)
+            except ValueError as e:
+                print(f"gemini_web: {e}", file=sys.stderr); sys.exit(2)
     if args.list_models:
         if os.environ.get("GEMINI_WEB_DRY_RUN") == "1":
             print("gemini-4-hydrogen\t4 Hydrogen\tdry-run\tavailable")
             print("gemini-neon\t4 Neon\tdry-run\tavailable")
             print("gemini-carbon\t4 Carbon\tdry-run\tavailable")
             sys.exit(0)
-        _maybe_reexec_venv()
+        _maybe_reexec_venv(need_browser_cookies=(args.cookies_file is None))
         sys.exit(asyncio.run(run_list_models(args)))
+    if args.quota:
+        if os.environ.get("GEMINI_WEB_DRY_RUN") == "1":
+            print(format_quota({"tier": "DRY-RUN", "h5": [1000, 10], "wk": [10000, 5], "h5_reset": None, "wk_reset": None, "ai_credits": None}))
+            sys.exit(0)
+        _maybe_reexec_venv(need_browser_cookies=(args.cookies_file is None))
+        sys.exit(asyncio.run(run_quota(args)))
     code, msg = validate_args(args)
     if code:
         print(f"gemini_web: {msg}", file=sys.stderr); sys.exit(code)
+    if args.model is None:
+        args.model = default_model_for_mode(args.mode)
     args.effort = args.effort or "high"
+    if args.aspect is not None:
+        args.aspect = validate_aspect(args.aspect)
     if args.estimate:
         print(format_estimate(args.mode, args.model, args.effort))
         sys.exit(0)
     dry_run = os.environ.get("GEMINI_WEB_DRY_RUN") == "1"
     if not dry_run:
-        _maybe_reexec_venv()
-    prompt = args.prompt if args.prompt is not None else sys.stdin.read()
-    if not prompt.strip():
-        print("gemini_web: empty prompt", file=sys.stderr); sys.exit(2)
+        _maybe_reexec_venv(need_browser_cookies=(args.cookies_file is None))
     out_dir: Path | None = None
     out_file: Path | None = None
     try:
+        if args.cookies_file is not None:
+            load_cookies_file(args.cookies_file)
+        if args.prompt_file is not None:
+            prompt = read_prompt_file(args.prompt_file)
+            _, pf_abs = _reject_symlink_prefix(args.prompt_file)
+            _refuse_same_as_default_cookies(pf_abs, "--prompt-file")
+            if args.cookies_file is not None:
+                check_not_same_file(pf_abs, args.cookies_file, "--prompt-file", "--cookies-file")
+        else:
+            prompt = args.prompt if args.prompt is not None else sys.stdin.read()
+        if not prompt.strip():
+            raise ValueError("empty prompt")
+        prompt = prepare_prompt(prompt, args.mode, aspect=args.aspect)
         if args.output:
             out_file = check_output_file(args.output)
+            _refuse_same_as_default_cookies(out_file, "--output")
+            if args.prompt_file is not None:
+                check_distinct_output_and_prompt(out_file, args.prompt_file)
+            if args.cookies_file is not None:
+                check_not_same_file(out_file, args.cookies_file, "--output", "--cookies-file")
         if args.mode in ("image", "video"):
             files = check_ref_images(args.ref, max_count=(1 if args.mode == "video" else None)) if args.ref else []
             if args.output_dir:
                 out_dir = check_output_dir(args.output_dir)
+                _refuse_same_as_default_cookies(out_dir, "--output-dir")
+                if args.cookies_file is not None:
+                    check_not_same_file(out_dir, args.cookies_file, "--output-dir", "--cookies-file")
             else:
                 check_cwd_writable()
         else:
             files = check_files(args.files) if args.files else []
+            for f in files:
+                fp = Path(os.path.abspath(f))
+                _refuse_same_as_default_cookies(fp, "--files")
+                if args.cookies_file is not None:
+                    check_not_same_file(fp, args.cookies_file, "--files", "--cookies-file")
     except ValueError as e:
         print(f"gemini_web: {e}", file=sys.stderr); sys.exit(2)
     if dry_run:
-        print(f"gemini_web: dry-run validated ({format_estimate(args.mode, args.model, args.effort)}, files={len(files)})", file=sys.stderr)
-        print(f"[dry-run] mode={args.mode} model={args.model} effort={args.effort} files={len(files)}")
+        extra = f", aspect={args.aspect}" if args.aspect else ""
+        extra_out = f" aspect={args.aspect}" if args.aspect else ""
+        print(f"gemini_web: dry-run validated ({format_estimate(args.mode, args.model, args.effort)}, files={len(files)}{extra})", file=sys.stderr)
+        print(f"[dry-run] mode={args.mode} model={args.model} effort={args.effort} files={len(files)}{extra_out}")
         sys.exit(0)
     sys.exit(asyncio.run(run(args, prompt, files, out_dir=out_dir, out_file=out_file)))
 
