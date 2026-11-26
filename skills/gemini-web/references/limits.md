@@ -2,7 +2,7 @@
 
 Read this before choosing Neon or high effort on a tight quota, before attaching large files or PDFs,
 and when deciding whether Deep Research or Tasks fits. Everything here was measured on one account on
-2026-11-24 unless it says "documented" (read on Google's help pages, which were summarized by a small model,
+2026-11-24 (Tasks on 2026-11-26) unless it says "documented" (read on Google's help pages, which were summarized by a small model,
 not quoted) or "not verified".
 
 ## Contents
@@ -132,12 +132,22 @@ One call per setting on 2026-11-24 on one PRO account, so read as a guide and no
 
 ## 7. Tasks
 
-Tasks (the app's agent mode) is not implemented in the script. The library has no parameter for it, and
-the request field that selects it was never captured because that would need a real message sent in Tasks
-mode with connected apps and the browser off. Documented about Tasks: experimental, needs History, up to 15
-concurrent tasks, can use connected apps and a browser, and Google's own page says it is vulnerable to
-prompt injection and needs supervision. The app's browser setting offers only "always allow" and "always
-ask", with no "off", which is why capturing it safely needs the connectors switched off first.
+Tasks is the app's agent mode. The library has no parameter for it. The script sets request field 50
+(index 49 of the request list) to 40, the value the app stores with a turn sent from the Tasks toggle; a
+chat turn stores nothing there. Observed on 2026-11-26: a request patched this way showed the Task card
+("Concluido") in the app. After a task reply the script reads the stored turn back (no credits) and exits 6
+when the value is not there; a timeout, usage limit or request error is not checked, so the task may have run. A task stays in the web history and is sent at most once per run.
+
+| Task | Credits | Time |
+| --- | --- | --- |
+| one web search with a one-line answer (`hydrogen`) | 22 | 21 s |
+| one code review of a 70,000-character prompt, no tools asked for (`neon`) | 49 | 267 s |
+
+The web app of that day sent its own messages to a different endpoint (`/v1/conversations:streamGenerate`)
+than the library uses. The old endpoint still answered; if it is removed, every mode stops working.
+
+Documented about Tasks: experimental, needs History, up to 15 concurrent tasks, can use connected apps and
+a browser, and Google's own page says it is vulnerable to prompt injection and needs supervision.
 
 ## 8. What is not known
 
@@ -147,4 +157,6 @@ ask", with no "off", which is why capturing it safely needs the connectors switc
 - The cause of the failure bursts: time of day, thinking level, or something else.
 - How long attachments and Deep Research chats stay on the server.
 - Whether Deep Research can finish on this account at all, and what it costs.
+- Tasks: what the script receives when a task runs longer than the reply, uses connected apps or asks for
+  confirmation; whether files or effort levels work with it; its cost range.
 - The range of image and video costs: one call each was measured.

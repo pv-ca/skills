@@ -1,15 +1,15 @@
 # gemini-web
 
-Send text, clean attached files, image generation/editing, short video generation and Deep Research requests from your coding agent to your own logged-in Gemini web session.
+Send text, clean attached files, image generation/editing, short video generation, Gemini Tasks and Deep Research requests from your coding agent to your own logged-in Gemini web session.
 
 ## What it does
 
 It wraps `scripts/gemini_web.py`, which talks to Gemini on the web with the Google cookies of a browser where you are
 already logged in (or a private `cookies.json` export via `--cookies-file`, for Windows or locked keyrings). You choose the model (`hydrogen`, `neon`, `carbon`, or any model returned by `--list-models`; defaults are `hydrogen` for text/research and `carbon` for image/video) and the thinking level (`low`, `medium`, `high`), attach
-regular files up to 300 KB in total, pass `--prompt-file` or `--aspect W:H`, generate and edit images, make short videos, check balances with `--quota` (0 credits), or try a Deep Research run (unconfirmed), all on a quota separate from your primary coding model's. Chats are
+regular files up to 300 KB in total, pass `--prompt-file` or `--aspect W:H`, generate and edit images, make short videos, check balances with `--quota` (0 credits), run a Gemini Task (`--mode tasks --allow-actions`), or try a Deep Research run (unconfirmed), all on a quota separate from your primary coding model's. Chats are
 temporary by default. The script refuses symlinks, folders, empty files and oversized attachments or prompt files before anything is sent,
 warns on high quota usage and skips the call (with window reset times) when your 5-hour window is nearly spent, retries the app's canned error notices, flags a silent change of
-model or thinking level, isolates the library's cookie cache in a per-run `0700` folder, and never prints or logs cookies. Gemini Tasks is not supported and the script refuses it.
+model or thinking level, isolates the library's cookie cache in a per-run `0700` folder, and never prints or logs cookies. A task can act on your connected apps and browser, so it needs `--allow-actions`, is sent only once and stays in your history.
 
 ## When to reach for it
 
@@ -26,7 +26,7 @@ Do not use it for local code edits, shell work, or anything private: secrets, cl
 - `python3 scripts/gemini_web.py --selftest` passes with no network.
 - A call with a clean prompt exits 0, prints the reply, and leaves nothing in your Gemini history unless you passed `--keep`.
 - An empty file, a symlink, or attachments over 300 KB fail with exit 2 before any request is sent.
-- `--mode tasks` exits 7 without `--confirm-apps-off` and 6 with it, and no cookie value appears in output or in the call log.
+- `--mode tasks` exits 7 without `--allow-actions`, and no cookie value appears in output or in the call log.
 
 ## Example
 

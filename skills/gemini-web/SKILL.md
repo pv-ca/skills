@@ -1,16 +1,15 @@
 ---
 name: gemini-web
 description: >-
-  Sends text prompts, attached files (up to 300 KB total), Deep Research requests, image generation or
+  Sends text prompts, attached files (up to 300 KB total), Deep Research requests, Gemini Tasks, image generation or
   reference-based image edits, and short video generation requests to the user's own logged-in Gemini web
   session through scripts/gemini_web.py, on a quota separate from Claude and from CLI model channels. Use
-  whenever the user asks to consult Gemini on the web, run Deep Research, generate or edit images or short
+  whenever the user asks to consult Gemini on the web, run Deep Research or a Gemini Task, generate or edit images or short
   videos with Gemini web, ask "Hydrogen", "Neon" or "Carbon" (the Gemini web models, not Neon Postgres or
   the google-genai SDK), get a second opinion from another model family, have a long public document or PDF
   read or summarized outside Claude, or spare the Claude quota on non-sensitive material. Do not use it for
   local repository edits, local media processing (ffmpeg, ImageMagick, Pillow), shell work, questions the
-  user wants Claude to answer itself, sensitive data or personal photos/IDs, google-genai SDK code, or
-  Gemini Tasks.
+  user wants Claude to answer itself, sensitive data or personal photos/IDs, or google-genai SDK code.
 ---
 
 # Gemini web
@@ -54,9 +53,12 @@ mode `0600` on POSIX). Read `references/auth.md` when the script exits with code
   holds sizes, credits and ids, never cookies, prompts or replies.
 - **Temporary chats by default.** `chat` mode does not leave the conversation in the web history unless
   `--keep` is passed. Pass `--keep` only when the user asks for the thread to stay.
-- **Tasks mode is not implemented.** `--mode tasks` exits with 7 without `--confirm-apps-off` and with 6
-  with it. Gemini Tasks can act on connected apps and on a browser, and Google documents it as
-  vulnerable to prompt injection. Never run Tasks with connected apps or the browser setting on.
+- **Tasks can act.** A Gemini Task can use the account's connected apps and a browser, and Google
+  documents it as vulnerable to prompt injection. Run `--mode tasks` only when the user asks for a Task
+  in this request, and pass `--allow-actions` only then (without it the script exits 7; `--estimate` does not need it). Never put
+  untrusted text (web pages, emails, other people's files) in a task prompt. Say in the prompt what the
+  task must not change, send or delete. The script sends a task once and never retries it: after any
+  failure, have the user check the app before sending it again.
 - **The quota is shared.** A call that fails costs nothing (measured), but every successful call spends
   credits from the same 5-hour and weekly windows the user's own Gemini use draws from. Say so before a
   large batch and state the estimated cost.
@@ -65,10 +67,10 @@ mode `0600` on POSIX). Read `references/auth.md` when the script exits with code
 ## Using it
 
 ```bash
-python3 scripts/gemini_web.py [--mode chat|research|image|video] [--model MODEL] [--effort low|medium|high] \
+python3 scripts/gemini_web.py [--mode chat|tasks|research|image|video] [--model MODEL] [--effort low|medium|high] \
   [--files FILE ...] [--ref IMG ...] [--aspect W:H] [--keep] [--output FILE] [--output-dir DIR] \
   [--prompt TEXT | --prompt-file FILE] [--timeout SECONDS] [--browser NAME] [--cookies-file FILE] \
-  [--list-models] [--quota] [--estimate]
+  [--list-models] [--quota] [--estimate] [--allow-actions]
 ```
 
 Pass the prompt inline with `--prompt TEXT` or pipe it on stdin (do not create temporary prompt files in the working directory for plain text prompts); use `--prompt-file FILE` (regular non-empty UTF-8 file up to 300,000 bytes, no symlinks, mutually exclusive with `--prompt`) only when the prompt already lives in a file or for complex structured JSON media specs. In text modes the reply goes to stdout (or `--output`); in `image` and `video` modes the saved file paths go to stdout, one per line. Diagnostics and quota warnings go to stderr. The call log is `$GEMINI_WEB_LOG`, by default `~/.local/share/gemini-web/calls.jsonl`.
@@ -80,11 +82,11 @@ Before a call the script reads both quota windows, warns on stderr when 5-hour o
 - `research`: Deep Research. Defaults to `--model hydrogen`. Refuses `--files`, `--ref`, `--output-dir`, `--aspect`, and `--effort` other than default (exit 2). Unconfirmed: in the one test run the research plan and the start worked, but no report was ready after 26 minutes (exit 5, 16 credits visible), so do not count on it. The conversation stays in the web history.
 - `image`: generates one or more images into `--output-dir` (default: a new timestamped folder in the current directory) and prints saved paths on stdout. Defaults to `--model carbon`. Accepts `--ref FILE ...` for editing or consistency, `--aspect W:H`, and `--prompt-file` (valid JSON objects/arrays automatically receive a short media-generation prefix). Uses temporary chat by default unless `--keep` is passed. Refuses `--files`, `--output`, and `--effort` (exit 2).
 - `video`: generates a short video into `--output-dir`, polls until ready within `--timeout`, and prints the saved path on stdout. Defaults to `--model carbon`. Accepts at most one `--ref FILE`, `--aspect W:H`, and `--prompt-file`. Always saves to web history (`temporary=False`) because pending video turns poll conversation history. Refuses `--files`, `--output`, and `--effort` (exit 2).
-- `tasks`: not implemented (see the security rules).
+- `tasks`: one Gemini Task (the app's agent mode), needs `--allow-actions` (see the security rules). Defaults to `--model hydrogen`. Always saves to web history. After a reply (also a refusal, an app error notice or an empty one), the script reads the stored turn and exits 6 if it cannot confirm a Task. Any other failure (timeout, usage limit, request error) keeps its own exit code without that check: the task may have run. A task reply that ends in a failing exit code is still printed or written to `--output`. Refuses `--files`, `--ref`, `--output-dir`, `--aspect`, and `--effort` (exit 2). It cannot continue a conversation, so it cannot answer a task's confirmation prompt: that happens in the app. Verified with three tasks only (a fixed reply; one web search, 22 credits, 21 s; one code review on `neon`, 49 credits, 267 s); tasks that outlast the reply, use connected apps or ask for confirmation are not verified.
 
 ### Model and effort
 
-`chat` and `research` default to `--model hydrogen`; `image` and `video` default to `--model carbon`. In chat, start with `--model hydrogen` and use `neon` only when the user asks for it or when Hydrogen is not enough: it cost about 8 times more per call and was slower in the screening. Effort `low`, `medium`, `high` maps to the app's Baixo, Medio, Alto; `medium` is a patched request value, so a change in the web request layout makes the script exit 6 instead of running at another level.
+`chat`, `tasks` and `research` default to `--model hydrogen`; `image` and `video` default to `--model carbon`. In chat, start with `--model hydrogen` and use `neon` only when the user asks for it or when Hydrogen is not enough: it cost about 8 times more per call and was slower in the screening. Effort `low`, `medium`, `high` maps to the app's Baixo, Medio, Alto; `medium` is a patched request value, so a change in the web request layout makes the script exit 6 instead of running at another level.
 
 | Setting | Credits per successful call | Latency (median) | Reliability in the measurement |
 | --- | --- | --- | --- |
@@ -129,7 +131,7 @@ and generic errors twice, in a new conversation, after 30 s and 90 s pauses. It 
 limit, a fallback, a patch failure, a timeout, a media reply that came back as text instead of a file, or an
 HTTP 400, 401 or 403 error (the free-failure rule was measured for text calls only). Failures came in
 bursts in the measurement (11 of 21 calls in the 15:00 hour of one afternoon), so when it exits
-with 3 or 8, use another channel or try later instead of looping.
+with 3 or 8, use another channel or try later instead of looping. None of these retries applies to `tasks`.
 
 | Exit | Meaning | What to do |
 | --- | --- | --- |
@@ -138,9 +140,9 @@ with 3 or 8, use another channel or try later instead of looping.
 | 2 | bad arguments, bad file/`--prompt-file`/`--ref`, missing dependency, no session | fix it; see `references/auth.md` |
 | 3 | canned refusal survived two retries | do not loop; use another channel |
 | 4 | usage limit or 5-hour window nearly spent (stderr prints reset time if available) | stop calling Gemini web until the reset |
-| 5 | timeout | raise `--timeout` for Neon and research, or shorten the prompt |
-| 6 | answered by another model, effort patch not applied, or unsupported mode | do not trust the reply as the requested model |
-| 7 | guard: tasks without `--confirm-apps-off` | keep Tasks off |
+| 5 | timeout | raise `--timeout` for Neon and research, or shorten the prompt; in `tasks`, check the app first |
+| 6 | answered by another model, effort or Tasks patch not applied, task not confirmed, or unsupported mode | do not trust the reply as the requested model or mode |
+| 7 | guard: tasks without `--allow-actions` | pass it only if the user asked for a Task |
 | 8 | canned error notice survived two retries | likely a server burst; try later or switch channel |
 
 Silent fallback: in `chat` mode the script reads the label of the model that answered from the raw
@@ -155,7 +157,7 @@ the quota); when no label is found the script says so on stderr and exits 0.
 ## Which reference to read
 
 - `references/limits.md`: before choosing Neon or high effort on a tight quota, before attaching large
-  files or PDFs, when deciding whether Deep Research fits, and for why Tasks is not supported.
+  files or PDFs, when deciding whether Deep Research fits, and for how Tasks mode was found and what is unverified.
 - `references/auth.md`: on exit code 2, on first use, or when the web layer changes after a
   `gemini-webapi` upgrade.
 - `references/media.md`: before calling `--mode image` or `--mode video`, for prompting structure, step-by-step `--ref` edits, consistency, output inspection, and media failure handling.

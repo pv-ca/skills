@@ -2,7 +2,7 @@
 """Call your own logged-in Gemini web session from a script: prompt on stdin (or --prompt / --prompt-file), reply or saved paths on stdout.
 
   gemini_web.py [--mode chat|tasks|research|image|video] [--model MODEL] [--effort low|medium|high] [--keep]
-                [--files F ...] [--ref IMG ...] [--aspect W:H] [--confirm-apps-off] [--output FILE] [--output-dir DIR]
+                [--files F ...] [--ref IMG ...] [--aspect W:H] [--allow-actions] [--output FILE] [--output-dir DIR]
                 [--prompt TEXT | --prompt-file FILE] [--timeout S] [--browser auto|edge|chrome|...]
                 [--cookies-file FILE] [--list-models] [--quota] [--estimate] [--selftest]
 
@@ -18,14 +18,16 @@ Exit codes:
   3 canned refusal or media policy refusal that survived two retries
   4 usage limit (hard limit, quota text, 5h window nearly spent, or 5h credits below estimate)
   5 timeout (including video polling)
-  6 silent fallback to another model, effort patch not applied, unsupported mode, or model unavailable on this account
-  7 refused by a guard (tasks without --confirm-apps-off)
+  6 silent fallback to another model, effort or Tasks patch not applied, task reply not confirmed as a Task,
+    unsupported mode, or model unavailable on this account
+  7 refused by a guard (tasks without --allow-actions)
   8 canned error notice ("something went wrong") that survived two retries
 Failed text calls cost no credits (measured; unverified for image/video), so retryable failures retry twice after 30 s and
-90 s pauses, in a new conversation. One line per call goes to $GEMINI_WEB_LOG (default ~/.local/share/gemini-web/calls.jsonl):
+90 s pauses, in a new conversation. A task is never retried or sent twice.
+One line per call goes to $GEMINI_WEB_LOG (default ~/.local/share/gemini-web/calls.jsonl):
 credits of both windows before and after, sizes, the answering model's label, conversation id. Never cookies, prompts or replies.
 """
-import argparse, asyncio, contextlib, importlib.util, json, os, random, re, shutil, stat, sys, tempfile, time
+import argparse, asyncio, contextlib, importlib.util, io, json, os, random, re, shutil, stat, sys, tempfile, time
 from datetime import datetime
 from pathlib import Path
 
@@ -34,6 +36,7 @@ DEFAULT_LOG_DIR = Path.home() / ".local/share/gemini-web"
 # Convenience aliases resolved at runtime via client.resolve_model(); any other name/alias/id from --list-models also works.
 MODELS = {"hydrogen": "gemini-4-hydrogen", "neon": "gemini-neon", "carbon": "gemini-carbon"}
 LEVEL = {"low": 1, "medium": 4, "high": 2}  # request field 81; the library only knows 1 and 2, medium (4) is patched below
+TASK_MODE_ID = 40  # request field 50 as the web app stores it for a turn sent in Tasks mode (observed 2026-11-26)
 MAX_FILES_BYTES = 300_000  # one measurement: a 1.78 MB text file was truncated near 380 KB without any error, so stay under that
 MAX_PROMPT_FILE_BYTES = 300_000  # safety cap for --prompt-file aligned with MAX_FILES_BYTES
 MAX_COOKIES_FILE_BYTES = 1_000_000  # 1 MB safety cap for --cookies-file JSON exports
@@ -59,6 +62,8 @@ ESTIMATED_CREDITS = {
     ("image", "hydrogen", "high"): (30, 30),
     ("image", "neon", "high"): (31, 31),
     ("video", "carbon", "high"): (880, 880),
+    ("tasks", "hydrogen", "high"): (22, 22),  # one web-search task, 2026-11-26; longer tasks surely cost more
+    ("tasks", "neon", "high"): (49, 49),  # one code-review task, 2026-11-26
 }
 # Mode-level fallback for image/video so the 5h credit guard still protects against high spend when another --model is passed.
 MODE_ESTIMATED_CREDITS = {
@@ -66,6 +71,7 @@ MODE_ESTIMATED_CREDITS = {
     "video": (880, 880),
 }
 HTTP_NO_RETRY = re.compile(r"\b(?:400|401|403)\b")
+AUTH_ERROR = re.compile(r"\b(401|403)\b|cookies? (have )?expired", re.I)
 REQUIRED_MODULES = ("curl_cffi", "gemini_webapi", "browser_cookie3")
 # The web app sometimes answers a plain request with a canned refusal; it is no answer. (Not reproduced in 23 later calls.)
 REFUSAL = re.compile(r"sou (apenas|só|somente) (um|uma)|(não|nao) (consigo|posso|tenho como) (te )?ajudar|as a (large )?language model|"
@@ -84,7 +90,7 @@ QUOTA = re.compile(r"(usage limit|limite de uso|reached (your|the) (daily |hourl
 LABEL = re.compile(rb'\\"[0-9a-f]{16}\\",null,null,\\"([^\\"]{1,40})\\",true')
 MODEL_PREFIX = re.compile(r"^gemini-(?:\d+(?:\.\d+)?-)?", re.I)
 HDR = "x-goog-ext-525001261-jspb"
-PATCH = {"level": None, "applied": False, "raw": []}  # raw: the response bodies of this process, kept in memory only
+PATCH = {"level": None, "task": False, "task_sent": False, "applied": False, "raw": []}  # raw: the response bodies of this process, kept in memory only
 
 
 def labels_in(body: bytes) -> list:
@@ -337,7 +343,8 @@ def format_estimate(mode: str, model: str, effort: str) -> str:
     if fallback:
         return (f"mode={mode} model={tok} effort={eff}: estimated credits={span} "
                 "(mode baseline measured with carbon on one account, 2026-11-24)")
-    return f"mode={mode} model={tok} effort={eff}: estimated credits={span} (measured on one account, 2026-11-24)"
+    date = "2026-11-26" if mode == "tasks" else "2026-11-24"
+    return f"mode={mode} model={tok} effort={eff}: estimated credits={span} (measured on one account, {date})"
 
 
 def default_model_for_mode(mode: str) -> str:
@@ -470,9 +477,10 @@ def validate_args(args) -> tuple[int, str]:
     if args.timeout <= 0:
         return 2, "--timeout must be a positive integer"
     if args.mode == "tasks":
-        if not args.confirm_apps_off:
-            return 7, "tasks mode can act on connected apps and the browser; pass --confirm-apps-off only after checking they are off"
-        return 6, "tasks mode is not implemented: the request field for Tasks was never captured (see references/limits.md)"
+        if not args.allow_actions and not getattr(args, "estimate", False):  # --estimate exits before anything is sent
+            return 7, "a task can act on your connected apps and browser; pass --allow-actions only when the user asked for a Gemini Task"
+        if args.files or args.ref or args.output_dir or args.effort is not None:
+            return 2, "tasks takes no --files, --ref, --output-dir, or --effort; leave them out"
     if args.model is not None and not str(args.model).strip():
         return 2, "--model must not be empty"
     cookies_file = getattr(args, "cookies_file", None)
@@ -512,7 +520,11 @@ def validate_args(args) -> tuple[int, str]:
     return 0, ""
 
 
-class PatchNotApplied(Exception):
+class PatchNotApplied(BaseException):  # not an Exception: the library would wrap it in APIError and retry for 75 s
+    pass
+
+
+class TaskResendBlocked(BaseException):  # same reason
     pass
 
 
@@ -543,6 +555,60 @@ def patch_request(data, hdr, lv):
     return {**data, "f.req": json.dumps(outer)}, {**hdr, key: json.dumps(h)}, True
 
 
+def patch_task_request(data):
+    """Selects Tasks mode in field 50 of a StreamGenerate request. Returns (data, applied)."""
+    if not isinstance(data, dict) or "f.req" not in data: return data, False
+    try:
+        outer = json.loads(data["f.req"]); inner = json.loads(outer[1])
+        if len(inner) <= 49 or inner[49] is not None: return data, False  # shape changed or field already used: do not guess
+        inner[49] = TASK_MODE_ID; outer[1] = json.dumps(inner)
+    except (ValueError, TypeError, IndexError, KeyError):
+        return data, False
+    return {**data, "f.req": json.dumps(outer)}, True
+
+
+def stored_mode_id(body: str):
+    """Mode id stored with the newest turn in a conversation-turns response; None when it cannot be read."""
+    for line in body.split("\n"):
+        if not line.startswith("[["):
+            continue
+        try:
+            parts = json.loads(line)
+        except ValueError:
+            continue
+        for part in parts:
+            try:
+                if part[0] == "wrb.fr":
+                    return json.loads(part[2])[0][0][2][6]
+            except (ValueError, TypeError, IndexError, KeyError):
+                continue
+    return None
+
+
+async def read_mode_id(c, cid):
+    """Free read of the stored turn, to confirm the app took the request as a Task."""
+    try:
+        from gemini_webapi.constants import GRPC
+        from gemini_webapi.types import RPCData
+        payload = json.dumps([cid, 1, None, 1, [1], [4], None, 1])
+        r = await asyncio.wait_for(c._batch_execute([RPCData(rpcid=GRPC.LIST_CONVERSATION_TURNS, payload=payload)]), 60)
+        return stored_mode_id(r.text)
+    except Exception as e:
+        print(f"gemini_web: reading the stored turn failed ({type(e).__name__}: {str(e)[:200]})", file=sys.stderr)
+        return None
+
+
+def guard_task_send(data):
+    """Patches a task request on its first send and blocks every later one: a task can act."""
+    if PATCH["task_sent"]:
+        raise TaskResendBlocked("a second send of the same task was blocked")
+    data, PATCH["applied"] = patch_task_request(data)
+    if not PATCH["applied"]:
+        raise PatchNotApplied("the Tasks patch did not apply (request layout changed): nothing was sent")
+    PATCH["task_sent"] = True
+    return data
+
+
 def install():
     from curl_cffi.requests import AsyncSession
     if getattr(AsyncSession, "_gw_patched", False): return
@@ -550,6 +616,8 @@ def install():
 
     def stream(self, method, url, *a, **kw):
         is_gen = "StreamGenerate" in str(url)
+        if is_gen and PATCH["task"]:
+            kw["data"] = guard_task_send(kw.get("data"))
         if is_gen and PATCH["level"]:
             kw["data"], kw["headers"], ok = patch_request(kw.get("data"), kw.get("headers") or {}, PATCH["level"])
             PATCH["applied"] = ok
@@ -559,17 +627,6 @@ def install():
         return _Tap(cm) if is_gen else cm
 
     AsyncSession.stream = stream; AsyncSession._gw_patched = True
-
-
-def _is_patch_error(exc: BaseException) -> bool:
-    cur: BaseException | None = exc
-    seen = set()
-    while cur is not None and id(cur) not in seen:
-        if isinstance(cur, PatchNotApplied):
-            return True
-        seen.add(id(cur))
-        cur = cur.__cause__ or cur.__context__
-    return False
 
 
 def _find_venv_python(script_path: Path | None = None) -> Path | None:
@@ -1262,6 +1319,7 @@ async def one_call(c, gex, args, prompt, files, resolved_model, out_dir: Path | 
     """One generate call. Returns a dict with status, text, saved paths, detail, err_kind, thoughts, cid, label, note, u0, u1, dur."""
     PATCH["raw"].clear(); PATCH["applied"] = False
     PATCH["level"] = LEVEL["medium"] if (args.mode == "chat" and args.effort == "medium") else None
+    PATCH["task"] = args.mode == "tasks"
     u0 = await usage(c); t0 = time.time(); deadline = t0 + args.timeout
     status, text, cid, note, detail, err_kind, thoughts = "ok", "", None, "", "", None, 0
     saved: list[str] = []
@@ -1351,8 +1409,9 @@ async def one_call(c, gex, args, prompt, files, resolved_model, out_dir: Path | 
                     _cleanup_empty_dirs(created_dirs)
         else:
             r = await asyncio.wait_for(
-                c.generate_content(prompt, files=files or None, model=resolved_model, temporary=not args.keep,
-                                   extended_thinking=args.effort != "low"),
+                c.generate_content(prompt, files=files or None, model=resolved_model,
+                                   temporary=args.mode != "tasks" and not args.keep,  # tasks need history
+                                   extended_thinking=args.mode != "tasks" and args.effort != "low"),
                 args.timeout,
             )
             text = (r.text or "").strip(); cid = (r.metadata or [None])[0]; thoughts = len(r.thoughts or "")
@@ -1362,24 +1421,32 @@ async def one_call(c, gex, args, prompt, files, resolved_model, out_dir: Path | 
         status, err_kind, detail = "limit", type(e).__name__, str(e)
     except PatchNotApplied as e:
         status, err_kind, note = "patch", "PatchNotApplied", str(e)
+    except TaskResendBlocked as e:
+        cause = e.__context__  # the first send's error, which made the library try to send again
+        status, err_kind, note = "error", "TaskResendBlocked", f"the first send failed; {e}"
+        if cause:
+            detail = f"{type(cause).__name__}: {str(cause)[:300]}"
+            if AUTH_ERROR.search(detail):
+                status = "auth"
     except gex.AuthError as e:
         status, err_kind, detail = "auth", type(e).__name__, str(e)[:300]
     except Exception as e:
-        if _is_patch_error(e):
-            status, err_kind, note = "patch", "PatchNotApplied", str(e)[:300]
-        else:
-            status, err_kind, detail = "error", type(e).__name__, f"{type(e).__name__}: {str(e)[:300]}"
-            if re.search(r"\b(401|403)\b|cookies? (have )?expired", detail, re.I):
-                status = "auth"
+        status, err_kind, detail = "error", type(e).__name__, f"{type(e).__name__}: {str(e)[:300]}"
+        if AUTH_ERROR.search(detail):
+            status = "auth"
 
     label = next((l for b in reversed(PATCH["raw"]) for l in reversed(labels_in(b))), None)
     if status == "ok" and args.effort == "medium" and args.mode == "chat" and not PATCH["applied"]:
         status, note = "patch", "the medium-effort patch did not apply (request shape changed): the call ran at another level"
-    if status == "ok" and args.mode in ("chat", "research"):  # quota notice comes first: it can also say "something went wrong"
+    if status == "ok" and args.mode in ("chat", "research", "tasks"):  # quota notice comes first: it can also say "something went wrong"
         if len(text) < 400 and QUOTA.search(text): status = "limit"
-        elif len(text) < 200 and TRANSIENT.search(text): status, detail, text = "transient", text, ""
+        elif len(text) < 200 and TRANSIENT.search(text): status, detail, text = "transient", text, (text if args.mode == "tasks" else "")
         elif len(text) < 300 and REFUSAL.search(text): status = "refused"
         elif not text: status = "empty"
+    # a refusal or app error can come from a plain chat that ignored the patch, so those replies are confirmed too
+    if args.mode == "tasks" and status in ("ok", "transient", "refused", "empty") and (not cid or await read_mode_id(c, cid) != TASK_MODE_ID):
+        looked = "" if status == "ok" else f" (the reply read as {status})"
+        status, note = "patch", f"could not confirm that the app stored this turn as a Task{looked}"
     u1 = await usage(c)
     if status == "ok" and args.mode == "chat" and len(text) < 250 and None not in (u0["h5"][0], u1["h5"][0]) and u0["h5"][0] == u1["h5"][0]:
         note = "short reply that cost no credits: may be an error notice the patterns do not know"
@@ -1449,7 +1516,7 @@ def _safe_file_bytes(files: list[str]) -> int:
 async def run(args, prompt, files, out_dir: Path | None = None, out_file: Path | None = None):
     file_bytes = _safe_file_bytes(files)
     with _isolated_cookie_cache():
-        c = None
+        c, r, delivered = None, {}, False
         try:
             try:
                 c, gex = await make_client(args.browser, args.timeout, cookies_file=getattr(args, "cookies_file", None))
@@ -1484,18 +1551,21 @@ async def run(args, prompt, files, out_dir: Path | None = None, out_file: Path |
                 r = await one_call(c, gex, args, prompt, files, resolved_model, out_dir=out_dir)
                 status, text, label, note, u0, u1, dur = r["status"], r["text"], r["label"], r["note"], r["u0"], r["u1"], r["dur"]
                 is_media = args.mode in ("image", "video")
+                again = retryable(status, r["detail"], args.mode)
                 log(mode=args.mode, model=args.model, resolved_model=resolved_model.model_name, effort=args.effort,
-                    temporary=(False if args.mode in ("research", "video") else not args.keep),
+                    temporary=(False if args.mode in ("research", "video", "tasks") else not args.keep),
                     attempt=attempt, status=status, err_kind=r["err_kind"], dur=dur, prompt_chars=len(prompt),
                     answer_chars=len(text), thought_chars=r["thoughts"], saved_files=len(r["saved"]),
                     files=0 if is_media else len(files), ref_files=len(files) if is_media else 0,
                     file_bytes=file_bytes, label=label, cid=r["cid"],
                     h5=[u0["h5"][0], u1["h5"][0]], pct5=u1["h5"][1], wk=[u0["wk"][0], u1["wk"][0]],
-                    retry_wait_s=wait if retryable(status, r["detail"]) and wait is not None else None)
-                if not retryable(status, r["detail"]) or wait is None:
+                    retry_wait_s=wait if again and wait is not None else None)
+                if not again or wait is None:
                     break
                 print(f"gemini_web: {status} on attempt {attempt}, retrying in a new conversation after {wait} s", file=sys.stderr)
                 await asyncio.sleep(wait + random.uniform(0, 5))
+            if args.mode == "tasks" and PATCH["task_sent"]:
+                print("gemini_web: tasks mode saves the conversation in web history", file=sys.stderr)
             u_post = merge_usage(merge_usage(u, u0), u1)
             if status == "timeout" and args.mode == "research" and r.get("cid"):
                 print(f"gemini_web: the research did not finish in time; conversation {r['cid']} is kept in the web history, look there later "
@@ -1506,13 +1576,7 @@ async def run(args, prompt, files, out_dir: Path | None = None, out_file: Path |
                 print(f"gemini_web: answered by '{label}', {dur}s, 5h credits {u0['h5'][0]}->{u1['h5'][0]}", file=sys.stderr)
             for w in quota_warnings(u_post, min_band_by_window=pre_bands):
                 print(f"gemini_web: {w}", file=sys.stderr)
-            if status == "ok":
-                if args.mode in ("image", "video"):
-                    for p in r["saved"]:
-                        print(p)
-                    if r["thumbs"]:
-                        print(f"gemini_web: thumbnail(s): {', '.join(r['thumbs'])}", file=sys.stderr)
-                    return 0
+            def hand_over():
                 if out_file is not None:
                     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
                     fd = os.open(out_file, flags, 0o600); os.fchmod(fd, 0o600)
@@ -1520,24 +1584,41 @@ async def run(args, prompt, files, out_dir: Path | None = None, out_file: Path |
                     print(f"gemini_web: reply written to {out_file}", file=sys.stderr)
                 else:
                     print(text)
+                    sys.stdout.flush()
+
+            if status == "ok":
+                if args.mode in ("image", "video"):
+                    for p in r["saved"]:
+                        print(p)
+                    if r["thumbs"]:
+                        print(f"gemini_web: thumbnail(s): {', '.join(r['thumbs'])}", file=sys.stderr)
+                    return 0
+                hand_over()
+                delivered = True
                 return 0
+            if args.mode == "tasks" and text:  # paid for and unsafe to re-send: keep the reply, the exit code still reports the failure
+                hand_over()
             msg_detail = (r["detail"] or text)[:300] or note or "no detail"
             if status == "limit":
                 msg_detail = format_limit_detail(msg_detail, u_post)
             print(f"gemini_web: {status}: {msg_detail}", file=sys.stderr)
             return EXIT.get(status, 1)
         finally:
+            if args.mode == "tasks" and PATCH["task_sent"] and not delivered:  # also covers crashes and Ctrl+C
+                where = f"conversation {r['cid']}" if r.get("cid") else "the newest conversation"
+                print(f"gemini_web: the task may have been sent and may have run or still be running; it was not re-sent. "
+                      f"Check {where} in the Gemini app before sending it again", file=sys.stderr)
             await _close_client(c)
 
 
 EXIT = {"limit": 4, "timeout": 5, "fallback": 6, "patch": 6, "unsupported": 6, "refused": 3, "transient": 8, "auth": 2}
 
 
-def retryable(status, detail=""):
-    """Retryable statuses; never retries limit, timeout, fallback, patch, unsupported, no_media, download_error, auth, or HTTP 400/401/403."""
-    return status in ("transient", "refused", "empty") or (
+def retryable(status, detail="", mode="chat"):
+    """A task is never retried. Retryable statuses; never retries limit, timeout, fallback, patch, unsupported, no_media, download_error, auth, or HTTP 400/401/403."""
+    return mode != "tasks" and (status in ("transient", "refused", "empty") or (
         status == "error" and not HTTP_NO_RETRY.search(detail)
-    )
+    ))
 
 def selftest():
     ok = 0
@@ -1571,9 +1652,7 @@ def selftest():
     check(applied and json.loads(json.loads(nd["f.req"])[1])[80] == 4 and json.loads(list(nh.values())[0])[-2] == 4, "level patch sets field 81 and header")
     check(not patch_request(d, {}, 4)[2], "patch refuses when the header is missing")
     check(not patch_request({"f.req": json.dumps([None, json.dumps([0] * 5)])}, {HDR: "[1,2,3]"}, 4)[2], "patch refuses a short request")
-    check(_is_patch_error(PatchNotApplied("x")) and not _is_patch_error(RuntimeError("HTTP 401")), "patch error detector does not swallow generic/auth errors")
-    wrapped = RuntimeError("wrap"); wrapped.__cause__ = PatchNotApplied("inner")
-    check(_is_patch_error(wrapped), "patch error detector unwraps chained PatchNotApplied")
+    check(not issubclass(PatchNotApplied, Exception), "a patch failure gets past the library's retries")
     with tempfile.TemporaryDirectory() as tmp1, tempfile.TemporaryDirectory() as tmp2:
         t = Path(tmp1); base = Path(tmp2)
         (t / "a.txt").write_text("x"); (t / "e.txt").write_text(""); (t / "big.txt").write_bytes(b"x" * (MAX_FILES_BYTES + 1))
@@ -1668,7 +1747,7 @@ def selftest():
         check("effort=n/a" in format_estimate("image", "gemini-carbon", "high") and "9-22" in format_estimate("chat", "gemini-4-hydrogen", "high"),
               "estimate: full model names find the row, effort only shown for chat")
 
-        ns = lambda **kw: argparse.Namespace(**{**dict(mode="chat", model=None, effort=None, files=[], ref=[], confirm_apps_off=False,
+        ns = lambda **kw: argparse.Namespace(**{**dict(mode="chat", model=None, effort=None, files=[], ref=[], allow_actions=False,
                                                         output=None, output_dir=None, aspect=None, prompt=None, prompt_file=None, timeout=600), **kw})
         check(validate_args(ns(mode="image", ref=["a.png"], output_dir="out", aspect="16:9"))[0] == 0, "valid image args with aspect")
         check(validate_args(ns(mode="video", ref=["a.png"], aspect="9:16"))[0] == 0, "valid video args with aspect")
@@ -1684,7 +1763,114 @@ def selftest():
         check(validate_args(ns(mode="chat", prompt="hi", prompt_file="p.txt"))[0] == 2, "--prompt and --prompt-file mutually exclusive")
         check(validate_args(ns(mode="chat", prompt="", prompt_file="p.txt"))[0] == 2, "empty --prompt with --prompt-file still refused")
         check(validate_args(ns(mode="chat", prompt_file="   "))[0] == 2, "blank --prompt-file refused")
-        check(validate_args(ns(mode="tasks"))[0] == 7 and validate_args(ns(mode="tasks", confirm_apps_off=True))[0] == 6, "tasks guards")
+        check(validate_args(ns(mode="tasks"))[0] == 7 and validate_args(ns(mode="tasks", allow_actions=True))[0] == 0, "tasks guards")
+        check(all(validate_args(ns(mode="tasks", allow_actions=True, **kw))[0] == 2 for kw in
+                  ({"files": ["a"]}, {"ref": ["a"]}, {"output_dir": "d"}, {"effort": "low"})), "tasks refuses untested options")
+        check(validate_args(ns(mode="tasks", estimate=True))[0] == 0, "a task estimate needs no --allow-actions")
+        real_main, real_argv = {k: globals()[k] for k in ("run", "make_client", "_maybe_reexec_venv")}, sys.argv
+        called, shown, code = [], io.StringIO(), None
+        def must_not_send(*a, **k): called.append(1); raise SystemExit(99)
+        try:
+            globals().update(run=must_not_send, make_client=must_not_send, _maybe_reexec_venv=lambda **k: None)
+            sys.argv = ["gemini_web.py", "--mode", "tasks", "--model", "neon", "--estimate", "--prompt", "x"]
+            with contextlib.redirect_stdout(shown):
+                main()
+        except SystemExit as e:
+            code = e.code
+        finally:
+            globals().update(real_main)
+            sys.argv = real_argv
+        check(code == 0 and not called and "credits=49" in shown.getvalue(), "a task estimate sends nothing")
+        req = lambda inner: {"f.req": json.dumps([None, json.dumps(inner)])}
+        sent, applied = patch_task_request(req([None] * 81))
+        check(applied and json.loads(json.loads(sent["f.req"])[1])[49] == TASK_MODE_ID, "tasks patch sets field 50")
+        check(not patch_task_request(req([None] * 10))[1] and not patch_task_request(req([None] * 49 + [1]))[1]
+              and not patch_task_request({})[1], "tasks patch refuses a short, used or missing request")
+        turns = lambda mode: ")]}'\n\n99\n" + json.dumps([["wrb.fr", None, json.dumps([[[None, None, [None] * 6 + [mode]]]])]])
+        check(stored_mode_id(turns(TASK_MODE_ID)) == TASK_MODE_ID and stored_mode_id(turns(None)) is None
+              and stored_mode_id("junk") is None, "stored mode id is read from a turns response")
+        empty = ")]}'\n\n9\n" + json.dumps([["wrb.fr", None, "[]"]])
+        check(stored_mode_id(empty + turns(TASK_MODE_ID)[4:]) == TASK_MODE_ID, "an empty frame does not hide the stored turn")
+        class Session:  # stands in for curl_cffi's AsyncSession, so the send guard is tested as install() wires it
+            def stream(self, method, url, **kw): sends.append(kw["data"]); return contextlib.nullcontext()
+        sends = []
+        saved_patch, real_curl = dict(PATCH), sys.modules.get("curl_cffi.requests")
+        try:
+            sys.modules["curl_cffi.requests"] = argparse.Namespace(AsyncSession=Session)
+            install()
+            PATCH.update(task=True, task_sent=False, applied=False, level=None)
+            Session().stream("POST", "https://x/StreamGenerate", data=req([None] * 81))
+            try:
+                Session().stream("POST", "https://x/StreamGenerate", data=req([None] * 81)); blocked = False
+            except TaskResendBlocked:
+                blocked = True
+            check(blocked and len(sends) == 1 and json.loads(json.loads(sends[0]["f.req"])[1])[49] == TASK_MODE_ID
+                  and not issubclass(TaskResendBlocked, Exception), "a task is sent only once, past the library's retries")
+        finally:
+            PATCH.update(saved_patch)
+            if real_curl is None: sys.modules.pop("curl_cffi.requests", None)
+            else: sys.modules["curl_cffi.requests"] = real_curl
+
+        async def fake_usage(c): return {"h5": [None, None], "wk": [None, None]}
+        class Replying:
+            def __init__(self, text): self.text = text
+            async def generate_content(self, *a, **k):
+                return argparse.Namespace(text=self.text, metadata=["c_x"], thoughts="")
+        real = usage, read_mode_id
+        got = []
+        try:
+            globals()["usage"] = fake_usage
+            for reply in ("I can't help with that.", "Sorry, something went wrong."):
+                for mode_id in (None, TASK_MODE_ID):
+                    async def fake_read(c, cid, mode_id=mode_id): return mode_id
+                    globals()["read_mode_id"] = fake_read
+                    r = asyncio.run(one_call(Replying(reply), None, ns(mode="tasks", effort=None, timeout=5), "p", [], "m"))
+                    got.append((r["status"], r["text"] == reply))
+        finally:
+            globals()["usage"], globals()["read_mode_id"] = real
+            PATCH.update(saved_patch)
+        check(got == [("patch", True), ("refused", True), ("patch", True), ("transient", True)],
+              "a failed task reply is still confirmed as a Task and keeps its text")
+
+        class Resent:
+            async def generate_content(self, *a, **k):
+                try: raise RuntimeError("Failed to generate contents. Status: 401")
+                except RuntimeError: raise TaskResendBlocked("blocked")
+        try:
+            globals()["usage"] = fake_usage
+            r = asyncio.run(one_call(Resent(), argparse.Namespace(TimeoutError=KeyError, UsageLimitExceededError=KeyError, AuthError=KeyError),
+                                     ns(mode="tasks", effort=None, timeout=5), "p", [], "m"))
+        finally:
+            globals()["usage"] = real[0]
+            PATCH.update(saved_patch)
+        check(r["status"] == "auth" and "401" in r["detail"], "a blocked re-send reports the first send's error")
+
+        calls = []
+        async def fake_make(*a, **k): return None, None
+        async def fake_close(c): return None
+        async def fake_balance(c): return {"h5": [1000, 1], "wk": [1000, 1], "h5_reset": None, "wk_reset": None}
+        async def fake_call(*a, **k):
+            calls.append(1); PATCH["task_sent"] = True
+            u = await fake_balance(None)
+            return dict(status="refused", text="partial reply", saved=[], thumbs=[], detail="", err_kind=None, thoughts=0,
+                        cid="c_x", label=None, note="", u0=u, u1=u, dur=1)
+        fakes = dict(make_client=fake_make, _close_client=fake_close, usage=fake_balance, one_call=fake_call, install=lambda: None,
+                     resolve_account_model=lambda c, m: (argparse.Namespace(model_name="m"), 0, ""), log=lambda **k: None)
+        originals = {k: globals()[k] for k in fakes}
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "reply.txt"
+            try:
+                globals().update(fakes)
+                with contextlib.redirect_stderr(err):
+                    code = asyncio.run(run(ns(mode="tasks", model="hydrogen", effort="n/a", keep=False, browser="auto"), "p", [], out_file=out))
+            finally:
+                globals().update(originals)
+                PATCH.update(saved_patch)
+            check(code == 3 and len(calls) == 1 and out.read_text() == "partial reply\n"
+                  and "before sending it again" in err.getvalue(), "a failed task keeps its reply, warns, and is not retried")
+        check(retryable("transient") and not retryable("transient", mode="tasks") and not retryable("error", mode="tasks"),
+              "tasks are never retried")
         check(validate_args(ns(timeout=0))[0] == 2, "non-positive timeout refused")
 
         # --aspect boundary checks
@@ -1884,7 +2070,6 @@ def selftest():
               "merge_usage falls back per field so partial post-call h5 keeps pre-call percentage for warnings")
 
         # Direct run_quota entry-point tests: exit 0/1/2, client close, cookies_file forwarding, and isolated cookie cache cleanup
-        import io
         orig_make_client = make_client
         q_args = argparse.Namespace(browser="auto", timeout=30, cookies_file=None)
         try:
@@ -2131,18 +2316,18 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--mode", choices=["chat", "tasks", "research", "image", "video"], default="chat")
     p.add_argument("--model", default=None,
-                   help="model alias (hydrogen, neon, carbon) or any model name/id shown by --list-models (default: carbon for image/video, hydrogen for chat/research)")
+                   help="model alias (hydrogen, neon, carbon) or any model name/id shown by --list-models (default: carbon for image/video, hydrogen for chat/tasks/research)")
     p.add_argument("--effort", choices=list(LEVEL), default=None,
                    help="thinking level for chat mode (default: high); low is Baixo, high is Alto")
     p.add_argument("--keep", action="store_true",
-                   help="keep the conversation in web history (default: temporary for chat/image; video and research always persist)")
+                   help="keep the conversation in web history (default: temporary for chat/image; video, research and tasks always persist)")
     p.add_argument("--files", nargs="+", default=[], help="regular files to attach (chat only; empty files and links are refused)")
     p.add_argument("--ref", nargs="+", default=[],
                    help="reference image files for image/video modes (regular non-empty PNG, JPEG, WebP or GIF only)")
     p.add_argument("--aspect", default=None,
                    help="target aspect ratio W:H for image/video modes (e.g. 16:9, 4:5, 1:1)")
-    p.add_argument("--confirm-apps-off", action="store_true", help="required by tasks: you assert connected apps and the browser are off")
-    p.add_argument("--output", help="write the text reply here (mode 600) instead of stdout (chat/research only)")
+    p.add_argument("--allow-actions", action="store_true", help="required by tasks: a task can act on your connected apps and browser")
+    p.add_argument("--output", help="write the text reply here (mode 600) instead of stdout (chat/tasks/research only)")
     p.add_argument("--output-dir", help="folder for saved images or video (default: new folder in current directory)")
     p.add_argument("--prompt", help="prompt text; default: read stdin")
     p.add_argument("--prompt-file", help="read prompt from a regular UTF-8 file (mutually exclusive with --prompt; JSON auto-prefixed in image/video)")
@@ -2193,7 +2378,7 @@ def main():
         print(f"gemini_web: {msg}", file=sys.stderr); sys.exit(code)
     if args.model is None:
         args.model = default_model_for_mode(args.mode)
-    args.effort = args.effort or "high"
+    args.effort = args.effort or ("n/a" if args.mode == "tasks" else "high")  # a task is sent with no thinking level
     if args.aspect is not None:
         args.aspect = validate_aspect(args.aspect)
     if args.estimate:

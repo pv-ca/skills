@@ -6,7 +6,7 @@ Guidance for running `scripts/gemini_web.py --mode image` and `--mode video`. Ev
 
 - **No separate media RPC in `gemini-webapi` 2.1.1** `[from library source]`: both images and videos are requested via `GeminiClient.generate_content()`, with the prompt and chosen `--model` triggering image or video creation.
 - **Model discovery** `[from library source]`: `constants.Model` is deprecated and contains no image or video models. Available models are discovered per account at startup via `client.list_models()` and matched by `client.resolve_model()`. Run `python3 scripts/gemini_web.py --list-models` to see what your account exposes.
-- **Default model and image routing**: `--mode image` and `--mode video` default to `--model carbon` (`chat` and `research` default to `hydrogen`). On one PRO account on 2026-11-24 (identical 1:1 prompt, 1 call per model, all returned 1024x1024 JPEGs) `[measured]`:
+- **Default model and image routing**: `--mode image` and `--mode video` default to `--model carbon` (`chat`, `tasks` and `research` default to `hydrogen`). On one PRO account on 2026-11-24 (identical 1:1 prompt, 1 call per model, all returned 1024x1024 JPEGs) `[measured]`:
   - `--model carbon` (default) and `--model gemini-auto` routed to `Nano Banana 2 Lite` (3 credits, 18 to 20 s; forcing extended thinking on `carbon` still routed to `Nano Banana 2 Lite` and cost 6 credits). Good default for drafts, iterations, and general images.
   - `--model hydrogen` and `--model neon` routed to `Nano Banana 2.1` (30 and 31 credits, 23 to 25 s, about 10x the cost of `carbon`). Reach for them when higher texture and lighting fidelity justify the extra credits.
   - Whether other accounts expose the same models or map them the same way is `[not verified]`.
