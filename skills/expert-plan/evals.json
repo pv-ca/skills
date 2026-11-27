@@ -4,7 +4,7 @@
       "id": "first-round-tag-at-end",
       "message": "I want to move our team's shared spreadsheets of customer orders into a small database. Plan it with me. /expert-plan",
       "expect": "fires",
-      "judge": "Only a first round, in plain Markdown with no emoji. The session read orders-jan.csv without editing it and asks nothing the file already answers (format, columns); it may cite what it saw (two spellings of one customer, mixed dates, a blank total). Numbered questions, one decision each, each with a 'Changes the plan' line and a recommendation worded so yes accepts it, saying what it rests on. At least one question asks about something that already happened, and none recommends 'tell me the number'. No plan block yet.",
+      "judge": "Only a first round, in plain Markdown with no emoji. The session read orders-jan.csv without editing it and asks nothing the file already answers (format, columns); it may cite what it saw (two spellings of one customer, mixed dates, a blank total). Numbered questions, one decision each, each with a 'Changes the plan' line and a recommendation worded so yes accepts it, saying what it rests on. At least one question asks about something that already happened, and none recommends 'tell me the number'. No recommendation invents a date, a duration or a cause that lives only with the user: it rests on something the user said or the file shows, or is a neutral default marked as one (a count the work can measure may be assumed for the first step to check). No plan block yet. Each number holds one decision: no number joins parts the user could answer yes and no to separately, and each recommendation answers every part of its number.",
       "files": {
         "orders-jan.csv": "order_id,customer,order_date,total\n1001,Northwind,2026-01-03,420.00\n1002,Northwind Inc.,04/01/2026,180.00\n1003,Contoso,2026-01-05,\n"
       }
@@ -13,19 +13,19 @@
       "id": "first-round-pt-br",
       "message": "/expert-plan quero planejar o lançamento de um curso online de fotografia para iniciantes",
       "expect": "fires",
-      "judge": "The round is in Portuguese with the labels 'Muda o plano' and 'Recomendação' and no emoji; its questions are about this course launch (not generic); at least one asks about the user's past experience or about comparable launches (an outside view); every recommendation is a concrete value or choice that a 'sim' settles (none says 'me diga' or 'tell me the number'); no question adds a deliverable the user did not ask for."
+      "judge": "The round is in Portuguese with the labels 'Muda o plano' and 'Recomendação' and no emoji; its questions are about this course launch (not generic); at least one asks about the user's past experience or about comparable launches (an outside view); every recommendation is a concrete value or choice that a 'sim' settles (none says 'me diga' or 'tell me the number'); no question adds a deliverable the user did not ask for. The outside-view number asks only how long comparable launches took, not also whether some gave up or what makes this case different. No recommendation invents a date, a duration or a cause only the user knows: it rests on something the user said or found, or is a neutral default marked as one. Each number holds one decision: no number joins parts the user could answer yes and no to separately, and each recommendation answers every part of its number."
     },
     {
       "id": "last-round-premortem",
       "message": "/expert-plan I want to move our team's shared spreadsheets of customer orders into a small database.\n\nYou already asked round 1 and I answered:\n1. Purpose: stop people overwriting each other and make orders queryable.\n2. Done: every order is in the database or listed as rejected with a reason, and a teammate spot-checks 20 orders.\n3. Untouched: the original sheets stay read-only as an archive.\n4. Fit: about 30,000 rows in Google Sheets, 4 people edit, nobody on the team runs servers, free tools only.\n5. Now vs later: only orders now; invoices maybe next year.\n\nGo on with the next round.",
       "expect": "fires",
-      "judge": "Does not repeat questions 1 to 5 and does not write the plan. The round sketches the plan in two or three lines, then asks a premortem (the work is done and failed: every reason, including ones not usually said) and a kill criterion in a state-and-date form; other questions, if any, are ones the answers above opened (for example 4 editors with no server). Questions are numbered from 6 on."
+      "judge": "Does not repeat questions 1 to 5 and does not write the plan. The round sketches the plan in two or three lines, then asks a premortem (the work is done and failed: every reason, including ones not usually said) a kill criterion in a state-and-date form, and a backcast (the work succeeded: what most made it work); other questions, if any, are ones the answers above opened (for example 4 editors with no server). Questions are numbered from 6 on. Each number holds one decision: no number joins parts the user could answer yes and no to separately, and each recommendation answers every part of its number."
     },
     {
       "id": "confirmation-gate",
       "message": "/expert-plan Plan the move of our order spreadsheets into a small database.\n\nAll rounds are done and these are settled: purpose, stop overwrites and make orders queryable; done, every order loaded or rejected with a reason and a teammate spot-checks 20; untouched, original sheets read-only; fit, 30,000 rows in Google Sheets, 4 editors, no server, free tools; later, invoices next year; premortem, the team keeps editing the sheets after the cutover; kill criterion, if two weeks after cutover more than one person still edits the sheets, stop and re-plan.\n\nyes to all",
       "expect": "fires",
-      "judge": "Says it has what it needs and asks whether to write the plan; no fenced plan block yet and no new round of questions."
+      "judge": "Does not write the plan: no fenced plan block. Either says it has what it needs and asks whether to write the plan, or asks exactly one question about a requirement the settled list leaves empty (such as whether the 4 editors agreed to the cutover) and says it will ask before writing; never a new round of several questions."
     },
     {
       "id": "plan-from-rounds",

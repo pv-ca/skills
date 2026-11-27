@@ -58,6 +58,10 @@ Seed the focus decisions with what only the user can tell you:
 - What the work is for: the decision it serves or the change it must cause,
   and what is in and out of scope.
 - What "done" looks like, and who or what will judge it.
+- Who will carry out the work and who can block it, if that is not the user
+  alone (*Decision Quality*: much of a decision's value is lost in the
+  handoff to the people who execute it). A plan the doers did not agree to
+  fails at the handoff.
 - What must stay untouched, and why.
 - What the plan has to fit: what the user already knows and uses, the
   resources they have (time, money, people), the systems, processes or
@@ -104,13 +108,23 @@ Then pick and word the questions with these moves:
   with one word of the question. Ask a question about the user's facts or
   context openly, and give your recommendation only as the assumption the
   plan will use if they do not know. For a choice of approach or tool, ask
-  the context questions first and recommend after them. Every recommendation
+  the context questions first and put the choice itself in the next round,
+  once those answers are in, so it never goes out without a recommendation
+  or with one picked before the context. Every recommendation
   says what it rests on: an answer the user gave, or a fact you found; if it
   rests on neither, say it is your default ("the first step checks it" says
   how it gets tested, not what it rests on). A recommendation is a value a
   "yes" settles: a number, a date, a named option, never "low", "a few" or
-  "months". Never recommend "tell me the number": recommend a value the plan
-  can assume and its first step checks.
+  "months", and never "tell me the number". Where the value comes from
+  depends on the kind of fact. A fact the work can measure (how many rows,
+  how long a script runs) gets a value the plan assumes and its first step
+  checks. A fact that lives only with the user (how long something took them
+  or people they know, why an earlier attempt failed, a date they have not
+  set) is never invented: recommend what they already said or what you
+  found, or else a neutral default the plan does not lean on, worded as a
+  named option and marked as your default ("no date yet: the plan sets one
+  once the first area is measured"; "no comparable case: the plan starts
+  with no base rate").
 - **Offer real alternatives for the key choice** (*Decision Quality*: a
   decision cannot be better than the best alternative considered). For the
   one or two choices the plan turns on, give two or three distinct options
@@ -121,14 +135,18 @@ Then pick and word the questions with these moves:
   how plans fail quietly.
 - **Calibrate by reversibility** (Annie Duke, *How to Decide*). If a choice
   can be undone and replaced at a reasonable cost, or the options are close
-  enough that any of them would do, give your default and no question. Ask
-  about what is costly to undo: deleting data, a public launch, a contract.
+  enough that any of them would do, give your default and no question. To
+  tell whether they are close enough, use Duke's Only-Option Test: if each
+  one were the only option, would the user be happy with it? If yes for all,
+  pick one and move on. Ask about what is costly to undo: deleting data, a
+  public launch, a contract.
 - **Take the user's outside view** (Kahneman and Lovallo, "Timid Choices and
   Bold Forecasts", 1993). Ask them to think of others who did something
-  comparable, from a point like theirs, and ask one thing: how long it took
-  them from there. Whether some gave up and what makes this case better or
-  worse go in the context sentence as things to mention, not as more
-  questions. People who know the
+  comparable, from a point like theirs, and ask one thing only: how long it
+  took them from there, in plain words with no label of its own. Whether
+  some gave up is a cause of failure, so it belongs to the premortem; what
+  makes this case better or worse goes to the next round, once the time is
+  in, and only if its answer would change the plan. People who know the
   answer still plan from the inside unless asked this way. Ask it in the
   first round, since its answer sets the scale of the rest; use it in the
   plan even when it is discouraging.
@@ -138,19 +156,27 @@ Then pick and word the questions with these moves:
   Klein, "Performing a Project Premortem", 2007). Klein runs it once people
   know the plan, so in the last round sketch the plan in two or three lines,
   then say that the time the work should take has passed and the plan
-  failed, and ask for every reason they can think of, above all the ones they
+  failed, and ask for every reason they can think of (counting what made
+  people they know stop, if any tried something comparable and gave up),
+  above all the ones they
   would not usually say out loud. Then ask for a kill criterion in Annie
   Duke's "states and dates" form (*Quit*): "if by <date> I have not <reached
   this state>, I stop." Recommend a criterion that tests the likeliest cause
   of failure (people going back to the old way, say), not a step of the work
-  that a script already checks. Their answers feed Likely failure and First
+  that a script already checks. Then the backcast, Duke's companion to the
+  premortem (*How to Decide*): the work succeeded; what is the one thing
+  that most made it work? It names what must go right, which the premortem
+  does not. Their answers feed Likely failure, External check and First
   step.
 
-Keep each question to one decision and plain words: the depth is in what you
-ask, not in how long the question is. Give each number one question mark:
-several questions under one number are several decisions, so keep the one
-that changes the plan most and move or drop the rest. Examples inside the
-question ("Google Sheets, Excel, something else") are fine.
+Keep each number to one decision and plain words: the depth is in what you
+ask, not in how long the question is. Different decisions get their own numbers, even if
+the round grows long: "have they agreed?" and "if one refuses, who decides?"
+are two. Test it: if the user could say "yes" to one part and "no" to
+another, split it. A part you split off goes to one of three places, never
+dropped silently: its own number in this round; the next round, if it only
+matters after another answer still open; or, if no answer would change the
+plan, a default the plan states.
 
 ### The rounds
 
@@ -165,7 +191,7 @@ Format a round like so, in plain Markdown with no emoji:
 ```
 **1. <question title>**
 
-<one or two sentences of context, if needed> <the one question, the only question mark>
+<one or two sentences of context, if needed> <the question: one decision>
 
 *Changes the plan:* <if A, the plan does X; if B, it does Y>
 
@@ -175,7 +201,7 @@ Format a round like so, in plain Markdown with no emoji:
 
 **2. <question title>**
 
-<context> <the one question>
+<context> <the question>
 
 *Changes the plan:* <...>
 
@@ -187,11 +213,23 @@ there X?" while recommending "no X". Write the round, labels included, in the
 user's language (in Portuguese: *Muda o plano:* and **Recomendação:**).
 Number questions across rounds, so a later round continues from the last
 number and the user can answer "3: no, ..." without ambiguity. End each round
-with one line on how to answer (by number, or "yes to all") and what the next
-turn does. Before sending a round, read the recommendations as if the user
-answered "yes to all": they must agree with each other (a target of 50 next
-to a base rate of 10 to 30 does not). A default says it is a default; "you
-did not mention it" is not what it rests on.
+with one line on how to answer (by number, or "yes to all", which accepts
+every recommendation, defaults included) and what the next turn does. Before
+sending a round, check it number by number:
+
+- Split test: could the user say "yes" to one part and "no" to another? Then
+  it is two decisions; split it into two numbers, or move the later part to
+  the next round if it only matters after the first is answered. Run it on
+  the recommendation too: one that adds a choice the question did not ask
+  ("yes, and the base components can start now") holds a second decision.
+- Every number has a recommendation, and it answers every part of its
+  number, so a "yes" settles the whole number.
+- Read the recommendations as if the user answered "yes to all": they must
+  agree with each other (a target of 50 next to a base rate of 10 to 30 does
+  not). A default says it is a default; "you did not mention it" is not what
+  it rests on. Since every number has one, "yes to all" is always a valid
+  answer: never say in the same round that some numbers only the user can
+  answer.
 
 Each round of answers reshapes the tree: settled decisions push the frontier
 outward and unblock the questions that depended on them. Recompute the
@@ -206,17 +244,31 @@ wide search, start a subagent with a fresh context. Don't block
 on it: only the questions downstream of a running search wait for it; ask the
 rest of the frontier now. The **decisions** are the user's: put each to them
 and wait. A fact you cannot reach (it lives only with the user, outside this
-environment) may be asked once, with an assumption as the recommendation, as
-above.
+environment) may be asked once, with the kind of recommendation given above
+for a fact that lives only with the user.
 
 Once the purpose, what done looks like, what stays untouched and what the plan
-has to fit are settled, the next round is the last one: the sketch, the
-premortem and the kill criterion, plus only the questions still blocking the
+has to fit are settled, the next round is the last one: the sketch (it
+assumes your recommended option for any choice still open in that round), the
+premortem, the kill criterion and the backcast, plus only the questions still blocking the
 plan. Details the first step can check are assumptions, not another round.
+This holds even when a tool or approach choice is still open: its context is
+in by now, so the choice goes in this same round with its alternatives, and a
+part that this section or the outside view would send to "the next round"
+becomes a default the plan states. Never add a round before the last one
+just for more context.
 
 The rounds are done when the frontier is empty: every branch visited, nothing
-left silently assumed. Then say in one line that you have what you need and
-ask whether to write the plan. Do not write it until the user confirms: a
+left silently assumed. Before saying so, check the weakest link (*Decision
+Quality*: a decision is only as good as the weakest of its six requirements):
+the frame, the alternatives, the information, the values and trade-offs, the
+reasoning, and the commitment of the people who will act. If one that only
+the user can fill (the frame, the values, the commitment) has nothing from
+the rounds behind it and would change the plan, ask one question about the
+weakest, never a new round; anything else becomes a default in the plan.
+If you ask it, say you will ask before writing the plan once it is answered;
+if not, say in one line that you have what you need and ask whether to write
+the plan. Do not write it until the user confirms: a
 "yes" to the questions, even "yes to all", answers the questions, not this.
 
 ## Part 2: the plan
