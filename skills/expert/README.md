@@ -26,13 +26,17 @@ I want to add a cache to my web app's product search endpoint because it feels s
 
 Without the skill, the agent picks Redis and starts writing cache code. With it, you get back a prompt that starts like this (shortened; full output in [example.md](example.md)):
 
+> I want to make product search feel fast to the people using it. [...] Before I add a cache, I want to find out where the time goes.
+>
 > **Field:** web backend performance engineering.
 >
-> **Expert moves:** "Feels slow" is not a number: record p50/p95/p99 and split the time between code, query, network and serialization. Decide how stale a price may be before choosing a cache.
+> **Expert moves:** treat "feels slow" as a hypothesis and measure first. Take the hit rate from the real query logs, not from an assumption. Decide the staleness budget before writing code.
 >
-> **Likely failure:** the cache goes in, searches are long-tail, the hit ratio is low and it still feels slow.
+> **External check:** "replay the same query sample against the endpoint before and after. Pass means p95 improves by a margin we agree on in advance and the cached responses are byte-identical to uncached ones for the same query." Then an automated staleness test, and production p95 after rollout.
 >
-> **First step:** record the baseline and run `EXPLAIN ANALYZE` on the main query, before any cache code.
+> **Likely failure:** the hit rate is low because queries are mostly unique, and p95 barely moves.
+>
+> **First step:** time one slow request stage by stage, before touching any caching code.
 
 ## It's working if
 
@@ -42,7 +46,7 @@ Without the skill, the agent picks Redis and starts writing cache code. With it,
 
 ## Tests
 
-[evals.json](evals.json) holds the cases: the tag at the end, the tag at the start, a task in Portuguese, and a question about experts that must not fire it. Run them with `python3 scripts/eval.py expert`. The last result is in [CHANGELOG.md](../../CHANGELOG.md).
+[evals.json](evals.json) holds the cases: the tag at the end, the tag at the start, a task in Portuguese, a churn analysis, a cause the user already assumed, a slide deck, and a question about experts that must not fire it. Run them with `python3 scripts/eval.py expert`. The last result is in [CHANGELOG.md](../../CHANGELOG.md).
 
 ## Credits
 

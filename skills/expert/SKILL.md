@@ -67,7 +67,14 @@ habits keep the answers honest:
 
 ## Steps
 
-Name the **field** first: the profession whose standard applies (e.g.
+First restate the deliverable's noun as the verb it must accomplish. The
+deliverable stays the same; the verb says what it is for: a quarterly review
+deck is there for "getting busy people to believe a story about cause and
+effect, and to decide under uncertainty, in 30 minutes" (a trick from Tom
+Kelley and Jonathan Littman's The Art of Innovation). Write that verb in the
+rewrite's opening paragraph; it shows which field owns the work.
+
+Then name the **field**: the profession whose standard applies (e.g.
 "investigative journalism", "SRE incident response", "clinical pharmacology",
 "essay editing"). Then answer these lines for that field. They appear once in
 the reply, inside the rewritten prompt; do not print them a second time before
@@ -101,6 +108,12 @@ it:
    result is right: a test suite or benchmark, a reproduction, ground-truth
    data, a known answer, a measurement, a domain expert or reviewer, a real
    user's behavior. Say what counts as a pass and what counts as a failure.
+   Where the work allows it, include at least one check the session can run
+   itself and get a pass or fail at once (a script, a test, a recomputation
+   from the raw data, a held-out sample the work was not tuned on), and a
+   person's judgment on top of it. The runnable check must test what matters
+   for this task, not a proxy made up to have something to run; if no such
+   check exists, say so and rely on the person.
 6. **Likely failure.** Run a premortem (Gary Klein): assume the work is done
    and has already failed, then write the most plausible cause. Asking "why did
    it fail?" surfaces concrete causes that "what could go wrong?" leaves out.

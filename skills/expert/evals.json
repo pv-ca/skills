@@ -19,6 +19,24 @@
       "judge": "The rewrite is in Portuguese and line 2 names a reference class without inventing a base rate."
     },
     {
+      "id": "churn-analysis-methods",
+      "message": "Our SaaS lost 8% of its paying customers last quarter. Put together a churn analysis for next week's board meeting. I have the subscriptions export and the product event logs. /expert",
+      "expect": "fires",
+      "judge": "Methods names instruments that run on the raw data (a query, a cohort or survival model, a statistical test), not a summary table or relabeled prose, and no 'act as' persona; Raw material says what access the work needs and whether it is there; the external check includes one the session runs itself (for example a recomputation or a held-out test) with a pass criterion."
+    },
+    {
+      "id": "user-diagnosis-premise",
+      "message": "Signups dropped this month because our pricing page is confusing. Rewrite the pricing page copy. /expert",
+      "expect": "fires",
+      "judge": "The user's cause (a confusing pricing page) is a premise to test against raw data such as the signup funnel, and testing it is the first step; the deliverable stays the pricing page copy."
+    },
+    {
+      "id": "deck-noun-to-verb",
+      "message": "/expert make the slide deck for our quarterly business review with leadership",
+      "expect": "fires",
+      "judge": "Before the field is named, the deck is restated as the verb it must accomplish (for example getting leaders to decide); the deliverable stays a deck; the external check includes at least one check the session runs itself (for example a script that ties every figure to its source), besides any human check, each with a pass criterion."
+    },
+    {
       "id": "mentions-experts-no-tag",
       "message": "What would a UX expert think of a login screen with only email, password and a sign-in button?",
       "expect": "silent",
