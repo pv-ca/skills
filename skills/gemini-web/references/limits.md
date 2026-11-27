@@ -73,6 +73,10 @@ not answer quality.
 | 10 small files | all seen and cited, about 3 credits |
 | one 233 KB text file | read start, middle and end, about 46 credits |
 | one 1.78 MB text file | accepted, read only to about 22% (the model said so), about 52 credits |
+| one 1.63 MB PNG image (`hydrogen` `low`, 2026-11-27) | accepted and read accurately, 3 credits |
+| one 1.07 MB 3-page PDF with embedded image + text on pages 1 and 3 (`hydrogen` `low`, 2026-11-27) | accepted, read and cited both page 1 and page 3 tokens, 4 credits |
+| small text file in `--mode tasks` (`hydrogen`, 2026-11-27) | accepted, read accurately, confirmed stored as Task (`mode_id=40`), 14 credits |
+| small text file in Deep Research plan turn (`hydrogen`, 2026-11-27, plan only) | accepted, returned a 3-step research plan built from the file's content, 11 credits (research not started) |
 
 - Questions over 7 Markdown files, pasted into the prompt or attached: about the same credits (3.4 and 3.6)
   and the same accuracy in 10 questions each (8 and 9 correct by a regex scorer, one run each, not a
@@ -142,6 +146,7 @@ when the value is not there; a timeout, usage limit or request error is not chec
 | --- | --- | --- |
 | one web search with a one-line answer (`hydrogen`) | 22 | 21 s |
 | one code review of a 70,000-character prompt, no tools asked for (`neon`) | 49 | 267 s |
+| one small text-file read, no apps/web (`hydrogen`, 2026-11-27) | 14 | not timed |
 
 The web app of that day sent its own messages to a different endpoint (`/v1/conversations:streamGenerate`)
 than the library uses. The old endpoint still answered; if it is removed, every mode stops working.
@@ -158,5 +163,7 @@ a browser, and Google's own page says it is vulnerable to prompt injection and n
 - How long attachments and Deep Research chats stay on the server.
 - Whether Deep Research can finish on this account at all, and what it costs.
 - Tasks: what the script receives when a task runs longer than the reply, uses connected apps or asks for
-  confirmation; whether files or effort levels work with it; its cost range.
+  confirmation; whether effort levels work with it; its cost range (one small text attachment worked on 2026-11-27; large or binary attachments in Tasks are not verified).
+- Large attachments: the actual server-side size limit for images, PDFs, Office docs, audio and video (the script uses 10 MB per file / 20 MB total as a safety cap), and whether a text-heavy PDF with > 300 KB of extracted text truncates like plain text.
+- Deep Research with files: plan creation from an attached text file worked on 2026-11-27, but starting and completing a full report with attached files has not been verified.
 - The range of image and video costs: one call each was measured.

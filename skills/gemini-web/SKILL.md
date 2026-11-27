@@ -1,7 +1,8 @@
 ---
 name: gemini-web
 description: >-
-  Sends text prompts, attached files (up to 300 KB total), Deep Research requests, Gemini Tasks, image generation or
+  Sends text prompts, attached files (plain text up to 300 KB total; images, PDFs, Office docs, audio and video up to
+  10 MB per file / 20 MB total across chat, tasks and research), Deep Research requests, Gemini Tasks, image generation or
   reference-based image edits, and short video generation requests to the user's own logged-in Gemini web
   session through scripts/gemini_web.py, on a quota separate from Claude and from CLI model channels. Use
   whenever the user asks to consult Gemini on the web, run Deep Research or a Gemini Task, generate or edit images or short
@@ -45,8 +46,10 @@ mode `0600` on POSIX). Read `references/auth.md` when the script exits with code
 
 - **Send clean material only.** Never put `.env` files, secrets, keys, certificates, password stores,
   database dumps, client records, personal documents or financial data in a prompt or in `--files`. The
-  script refuses symlinks, folders, empty files and attachments over 300,000 bytes in total, and validates
-  `--output` against symlinks and directories before calling.
+  script refuses symlinks, folders, empty files, plain-text or unrecognized attachments over 300,000 bytes in total, and
+  rich/binary attachments (verified by magic bytes and container structure: images, PDFs, Office/ODF/EPUB docs, audio, video) over
+  10 MB per file or 20 MB total, stages attachments into a private per-run `0700` temp folder (`0600` files, wiped on normal exit),
+  and validates `--output` against symlinks and directories before calling.
 - **Never print, copy or log cookie values.** The script redirects `gemini-webapi`'s cookie cache into a
   private per-run `0700` temp folder removed on exit (preventing cookies from persisting in `/tmp` or
   shadowing fresh browser cookies). The call log is created with mode `0600` (inside a `0700` folder) and
@@ -79,10 +82,10 @@ Before a call the script reads both quota windows, warns on stderr when 5-hour o
 ### Mode
 
 - `chat` (default): one prompt, optional `--files`, temporary conversation. Defaults to `--model hydrogen`. Refuses `--ref`, `--output-dir`, and `--aspect` (exit 2).
-- `research`: Deep Research. Defaults to `--model hydrogen`. Refuses `--files`, `--ref`, `--output-dir`, `--aspect`, and `--effort` other than default (exit 2). Unconfirmed: in the one test run the research plan and the start worked, but no report was ready after 26 minutes (exit 5, 16 credits visible), so do not count on it. The conversation stays in the web history.
+- `research`: Deep Research, optional `--files` (sent on the plan-creation turn). Defaults to `--model hydrogen`. Refuses `--ref`, `--output-dir`, `--aspect`, and `--effort` other than default (exit 2). Unconfirmed: plan creation with an attached file worked on 2026-11-27 (11 credits, 3-step plan built from the file), and without files the plan and start worked earlier, but no finished report arrived after 26 minutes in the full run (exit 5, 16 credits visible), so do not count on completion. The conversation stays in the web history.
 - `image`: generates one or more images into `--output-dir` (default: a new timestamped folder in the current directory) and prints saved paths on stdout. Defaults to `--model carbon`. Accepts `--ref FILE ...` for editing or consistency, `--aspect W:H`, and `--prompt-file` (valid JSON objects/arrays automatically receive a short media-generation prefix). Uses temporary chat by default unless `--keep` is passed. Refuses `--files`, `--output`, and `--effort` (exit 2).
 - `video`: generates a short video into `--output-dir`, polls until ready within `--timeout`, and prints the saved path on stdout. Defaults to `--model carbon`. Accepts at most one `--ref FILE`, `--aspect W:H`, and `--prompt-file`. Always saves to web history (`temporary=False`) because pending video turns poll conversation history. Refuses `--files`, `--output`, and `--effort` (exit 2).
-- `tasks`: one Gemini Task (the app's agent mode), needs `--allow-actions` (see the security rules). Defaults to `--model hydrogen`. Always saves to web history. After a reply (also a refusal, an app error notice or an empty one), the script reads the stored turn and exits 6 if it cannot confirm a Task. Any other failure (timeout, usage limit, request error) keeps its own exit code without that check: the task may have run. A task reply that ends in a failing exit code is still printed or written to `--output`. Refuses `--files`, `--ref`, `--output-dir`, `--aspect`, and `--effort` (exit 2). It cannot continue a conversation, so it cannot answer a task's confirmation prompt: that happens in the app. Verified with three tasks only (a fixed reply; one web search, 22 credits, 21 s; one code review on `neon`, 49 credits, 267 s); tasks that outlast the reply, use connected apps or ask for confirmation are not verified.
+- `tasks`: one Gemini Task (the app's agent mode), optional `--files` (clean, trusted files only; never attach untrusted third-party files to a Task), needs `--allow-actions` (see the security rules). Defaults to `--model hydrogen`. Always saves to web history. After a reply (also a refusal, an app error notice or an empty one), the script reads the stored turn and exits 6 if it cannot confirm a Task. Any other failure (timeout, usage limit, request error) keeps its own exit code without that check: the task may have run. A task reply that ends in a failing exit code is still printed or written to `--output`. Refuses `--ref`, `--output-dir`, `--aspect`, and `--effort` (exit 2). It cannot continue a conversation, so it cannot answer a task's confirmation prompt: that happens in the app. Verified with four tasks only (a fixed reply; one web search, 22 credits, 21 s; one code review on `neon`, 49 credits, 267 s; one text-file read on `hydrogen`, 14 credits, confirmed `mode_id=40`); tasks that outlast the reply, use connected apps or ask for confirmation are not verified.
 
 ### Model and effort
 
@@ -106,10 +109,12 @@ judgment); whether higher effort improves quality is not established. Details in
 
 - Paste short text and diffs directly into `--prompt` as a single command (do not write temporary prompt files): attaching a diff was 27% slower and cost more credits for the same
   recall on 11 review cases (8 with a planted defect, 3 clean).
-- Attached Markdown or text files cost about the same as the same text pasted. PDFs cost about 4.5 times
-  more and took about 50% longer (cause unknown): prefer text when you can extract it.
-- A file larger than about 380 KB is cut silently (a 1.78 MB file was read only to about 22%). A single
-  233 KB file cost about 46 credits. The script caps the total at 300,000 bytes.
+- Attached Markdown or text files cost about the same as the same text pasted. Small PDFs cost about 4.5 times
+  more and took about 50% longer than extracted text (cause unknown): prefer text when you can extract it.
+- Plain-text files larger than about 380 KB are cut silently (a 1.78 MB text file was read only to about 22%). A single
+  233 KB text file cost about 46 credits. The script caps plain-text attachments at 300,000 bytes in total.
+- Rich/binary attachments recognized by real magic bytes and container structure (images: PNG, JPEG, WebP, GIF, AVIF, HEIC/HEIF; PDFs; audio: WAV, MP3, OGG, FLAC, M4A; video: MP4, MOV, WebM, AVI; OOXML/ODF/EPUB/OLE2 documents) allow up to 10 MB per file and 20 MB total across all `--files`. On 2026-11-27 (`hydrogen` `low`), a 1.63 MB PNG (3 credits) and a 1.07 MB 3-page PDF with an embedded image and text on pages 1 and 3 (4 credits) were read completely without truncation; very long text-heavy PDFs and the actual server-side binary ceiling are not verified.
+- `--files` works in `chat`, `tasks` (trusted files only, never untrusted input), and `research` (attached on the plan-creation turn).
 - An empty file makes the whole request fail with HTTP 400; the script refuses it before sending.
 
 ### Images and video

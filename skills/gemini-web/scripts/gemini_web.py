@@ -27,7 +27,7 @@ Failed text calls cost no credits (measured; unverified for image/video), so ret
 One line per call goes to $GEMINI_WEB_LOG (default ~/.local/share/gemini-web/calls.jsonl):
 credits of both windows before and after, sizes, the answering model's label, conversation id. Never cookies, prompts or replies.
 """
-import argparse, asyncio, contextlib, importlib.util, io, json, os, random, re, shutil, stat, sys, tempfile, time
+import argparse, asyncio, contextlib, importlib.util, io, json, os, random, re, shutil, stat, sys, tempfile, time, zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -37,12 +37,15 @@ DEFAULT_LOG_DIR = Path.home() / ".local/share/gemini-web"
 MODELS = {"hydrogen": "gemini-4-hydrogen", "neon": "gemini-neon", "carbon": "gemini-carbon"}
 LEVEL = {"low": 1, "medium": 4, "high": 2}  # request field 81; the library only knows 1 and 2, medium (4) is patched below
 TASK_MODE_ID = 40  # request field 50 as the web app stores it for a turn sent in Tasks mode (observed 2026-11-26)
-MAX_FILES_BYTES = 300_000  # one measurement: a 1.78 MB text file was truncated near 380 KB without any error, so stay under that
+MAX_FILES_BYTES = 300_000  # plain-text cap: a 1.78 MB text file was truncated near 380 KB without error, so text attachments stay under 300 KB
+MAX_BINARY_FILE_BYTES = 10_000_000  # 10 MB per rich/binary attachment (image, PDF, audio, video, Office/ODF/EPUB; server cap not verified)
+MAX_FILES_TOTAL_BYTES = 20_000_000  # 20 MB total across all --files attachments (safety cap aligned with MAX_REF_TOTAL_BYTES)
 MAX_PROMPT_FILE_BYTES = 300_000  # safety cap for --prompt-file aligned with MAX_FILES_BYTES
 MAX_COOKIES_FILE_BYTES = 1_000_000  # 1 MB safety cap for --cookies-file JSON exports
 MAX_REF_FILE_BYTES = 10_000_000  # 10 MB per reference image (safety cap; actual server limit is not verified)
 MAX_REF_TOTAL_BYTES = 20_000_000  # 20 MB total across --ref images (not verified against server cap)
 ALLOWED_REF_EXTS = {".png", ".jpg", ".webp", ".gif"}
+HEIF_BRANDS = (b"heic", b"heix", b"heif", b"hevc", b"mif1", b"msf1")
 ASPECT_RE = re.compile(r"\A(\d{1,2}):(\d{1,2})\Z")
 COOKIE_DOMAIN_RE = re.compile(r"\A[a-z0-9.-]+\Z")
 QUOTA_WARN_BANDS = (90, 75, 50)
@@ -126,20 +129,192 @@ def label_verdict(label, model: str, effort: str = "high", check_effort: bool = 
         return False, f"answered by '{label}' but effort '{effort}' was requested"
     return True, ""
 
-def check_files(paths):
-    """Only regular, non-empty files: an empty file makes the whole request fail (HTTP 400), links and folders could leak the repository."""
-    total, out = 0, []
-    for p in paths:
-        pp = Path(p)
-        if pp.is_symlink() or not pp.is_file() or pp.resolve() != Path(os.path.abspath(pp)):
-            raise ValueError(f"{p}: not a regular file, or a link on the way to it (links and folders are refused)")
-        n = pp.stat().st_size
+def _is_zip_document(file_obj) -> bool:
+    """Inspects an open seekable ZIP file object for OOXML or ODF/EPUB structure (central directory + <=128 B mimetype)."""
+    try:
+        file_obj.seek(0)
+        with zipfile.ZipFile(file_obj, "r") as zf:
+            names = set(zf.namelist())
+            if "[Content_Types].xml" in names and any(n.startswith(("word/", "xl/", "ppt/")) for n in names):
+                return True
+            if "mimetype" in names:
+                info = zf.getinfo("mimetype")
+                if 0 < info.file_size <= 128:
+                    with zf.open(info, "r") as mf:
+                        mt = mf.read(129)
+                    if len(mt) <= 128:
+                        mt = mt.strip()
+                        if mt == b"application/epub+zip" or mt.startswith(b"application/vnd.oasis.opendocument."):
+                            return True
+    except (zipfile.BadZipFile, OSError, ValueError):
+        return False
+    return False
+
+
+def detect_binary_attachment_kind(head: bytes, file_obj=None) -> str | None:
+    """Identifies rich/binary attachment formats from real magic bytes (and ZIP structure for OOXML/ODF/EPUB),
+    or None for plain text / unrecognized files.
+
+    Never relies on file extensions, so plain text (including UTF-16LE BOMs or random data prefixed with
+    PK\\x03\\x04) renamed to .pdf/.png/.docx still stays under the 300 KB silent-truncation cap.
+    """
+    if detect_image_ext(head) is not None:
+        return "image"
+    if len(head) >= 12 and head[4:8] == b"ftyp" and head[8:12] in HEIF_BRANDS:
+        return "image"
+    if head.startswith(b"%PDF-"):
+        return "pdf"
+    if detect_video_ext(head) is not None:
+        return "video"
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "audio"
+    if len(head) >= 12 and head[4:8] == b"ftyp" and head[8:12] in (b"M4A ", b"M4B "):
+        return "audio"
+    if len(head) >= 5 and head[:4] == b"OggS" and head[4] == 0:
+        return "audio"
+    if len(head) >= 5 and head[:4] == b"fLaC" and (head[4] & 0x7F) == 0:
+        return "audio"
+    if len(head) >= 10 and head[:3] == b"ID3" and head[3] in (2, 3, 4) and head[4] == 0 and all(b < 0x80 for b in head[6:10]):
+        return "audio"
+    if len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0 and (head[1] & 0x18) != 0x08 and (head[1] & 0x06) == 0x02:
+        return "audio"
+    if head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return "document"
+    if head.startswith(b"PK\x03\x04") and file_obj is not None and _is_zip_document(file_obj):
+        return "document"
+    return None
+
+
+def _open_validated_regular(path_str: str, forbidden_inodes: set[tuple[int, int]] = frozenset()) -> tuple[Path, int, int]:
+    """Validates no symlinks along any raw path component, opens without following symlinks, checks regular non-empty file
+    and forbidden device/inode pairs, and returns (raw_path, open_fd, st_size). Caller owns closing open_fd.
+    """
+    if not isinstance(path_str, (str, Path)) or not str(path_str).strip():
+        raise ValueError("file path must not be empty")
+    raw_str = str(path_str)
+    pp, abs_p = _reject_symlink_prefix(raw_str)
+    if pp.is_symlink() or not pp.is_file():
+        raise ValueError(f"{raw_str}: not a regular file, or a link on the way to it (links and folders are refused)")
+    try:
+        fd = _open_regular_nofollow(abs_p)
+    except OSError as e:
+        raise ValueError(f"{raw_str}: cannot open regular file ({e.strerror or e})") from e
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"{raw_str}: not a regular file (links and folders are refused)")
+        if (st.st_dev, st.st_ino) in forbidden_inodes:
+            raise ValueError(f"{raw_str}: must not refer to the cookies file")
+        n = st.st_size
         if n == 0:
-            raise ValueError(f"{p}: empty file (the API answers HTTP 400 and the call fails)")
-        total += n; out.append(str(pp))
-    if total > MAX_FILES_BYTES:
-        raise ValueError(f"attachments total {total} bytes, over the {MAX_FILES_BYTES} limit (larger files are silently truncated)")
+            raise ValueError(f"{raw_str}: empty file (the API answers HTTP 400 and the call fails)")
+    except Exception:
+        os.close(fd)
+        raise
+    return pp, fd, n
+
+
+def _copy_bounded_to_stage(file_obj, stage_dir: Path, idx: int, orig_name: str, limit: int, label: str) -> tuple[Path, int]:
+    """Streams an already-validated open file object from offset 0 into stage_dir/<idx>/<orig_name> (mode 0600),
+    enforcing limit on actual bytes read to prevent concurrent-growth TOCTOU.
+    """
+    safe_name = Path(orig_name).name or f"file_{idx}"
+    slot = stage_dir / str(idx)
+    slot.mkdir(mode=0o700, exist_ok=True)
+    dest = slot / safe_name
+    file_obj.seek(0)
+    written = 0
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    out_fd = os.open(dest, flags, 0o600)
+    try:
+        os.fchmod(out_fd, 0o600)
+    except (AttributeError, OSError):
+        pass
+    try:
+        with os.fdopen(out_fd, "wb") as dst:
+            out_fd = -1
+            while True:
+                chunk = file_obj.read(min(65536, limit - written + 1))
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > limit:
+                    raise ValueError(f"{label}: file grew past the {limit} byte limit during staging")
+                dst.write(chunk)
+    except Exception:
+        if out_fd >= 0:
+            os.close(out_fd)
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        raise
+    if written == 0:
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        raise ValueError(f"{label}: empty file (the API answers HTTP 400 and the call fails)")
+    return dest, written
+
+
+def _validate_files_impl(
+    paths,
+    *,
+    stage_dir: Path | None = None,
+    forbidden_inodes: set[tuple[int, int]] = frozenset(),
+) -> list[str]:
+    text_total, grand_total, out = 0, 0, []
+    for idx, p in enumerate(paths):
+        pp, fd, n = _open_validated_regular(p, forbidden_inodes=forbidden_inodes)
+        try:
+            with os.fdopen(fd, "rb") as f:
+                fd = -1
+                if n > MAX_BINARY_FILE_BYTES:
+                    raise ValueError(f"{p}: attachment is {n} bytes, over the {MAX_BINARY_FILE_BYTES} per-file limit")
+                head = f.read(16)
+                if not head:
+                    raise ValueError(f"{p}: empty file (the API answers HTTP 400 and the call fails)")
+                kind = detect_binary_attachment_kind(head, file_obj=f)
+                if kind is None:
+                    rem_text = MAX_FILES_BYTES - text_total
+                    if n > rem_text:
+                        raise ValueError(
+                            f"plain-text or unrecognized attachments total {text_total + n} bytes, over the {MAX_FILES_BYTES} limit "
+                            f"(plain text is silently truncated above ~380 KB; only recognized images, PDFs, audio, video, and Office/ODF/EPUB documents allow up to 10 MB each)"
+                        )
+                    cap = min(rem_text, MAX_FILES_TOTAL_BYTES - grand_total)
+                else:
+                    cap = min(MAX_BINARY_FILE_BYTES, MAX_FILES_TOTAL_BYTES - grand_total)
+                if n > MAX_FILES_TOTAL_BYTES - grand_total:
+                    raise ValueError(
+                        f"attachments total {grand_total + n} bytes, over the {MAX_FILES_TOTAL_BYTES} total limit"
+                    )
+                if stage_dir is not None:
+                    dest, actual = _copy_bounded_to_stage(f, stage_dir, idx, pp.name, cap, str(p))
+                    if kind is None:
+                        text_total += actual
+                    grand_total += actual
+                    out.append(str(dest))
+                else:
+                    if kind is None:
+                        text_total += n
+                    grand_total += n
+                    out.append(str(pp))
+        finally:
+            if fd >= 0:
+                os.close(fd)
     return out
+
+
+def check_files(paths):
+    """Validates --files: regular non-empty files (no symlinks). Plain text is capped at MAX_FILES_BYTES (300 KB total);
+    recognized binary/media/document files (image, PDF, audio, video, OOXML/ODF/EPUB/OLE2) allow up to
+    MAX_BINARY_FILE_BYTES per file and MAX_FILES_TOTAL_BYTES in total.
+    """
+    return _validate_files_impl(paths)
+
+
 def detect_image_ext(data: bytes) -> str | None:
     """Returns the canonical extension from real image magic bytes, or None if unrecognized."""
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -161,8 +336,10 @@ def detect_video_ext(data: bytes) -> str | None:
         brand = data[8:12]
         if brand == b"qt  ":
             return ".mov"
-        if brand in (b"isom", b"iso2", b"iso5", b"iso6", b"mp41", b"mp42", b"avc1", b"M4V ", b"MSNV", b"dash"):
+        if brand in (b"isom", b"iso2", b"iso3", b"iso4", b"iso5", b"iso6", b"mp41", b"mp42", b"avc1", b"M4V ", b"MSNV", b"dash", b"mmp4"):
             return ".mp4"
+        if brand in (b"3gp4", b"3gp5"):
+            return ".3gp"
         return None  # avif, heic, M4A and other ISO-BMFF payloads are not videos
     if data.startswith(b"\x1a\x45\xdf\xa3"):
         return ".webm"
@@ -171,30 +348,86 @@ def detect_video_ext(data: bytes) -> str | None:
     return None
 
 
-def check_ref_images(paths, max_count: int | None = None):
-    """Validates --ref files: regular non-empty files (no symlinks), within size cap, and real image magic bytes."""
+def _validate_ref_images_impl(
+    paths,
+    max_count: int | None = None,
+    *,
+    stage_dir: Path | None = None,
+    forbidden_inodes: set[tuple[int, int]] = frozenset(),
+) -> list[str]:
     if max_count is not None and len(paths) > max_count:
         raise ValueError(f"too many --ref images ({len(paths)}): at most {max_count} allowed for this mode")
     total, out = 0, []
-    for p in paths:
-        pp = Path(p)
-        if pp.is_symlink() or not pp.is_file() or pp.resolve() != Path(os.path.abspath(pp)):
-            raise ValueError(f"{p}: not a regular file, or a link on the way to it (links and folders are refused)")
-        n = pp.stat().st_size
-        if n == 0:
-            raise ValueError(f"{p}: empty file (the API answers HTTP 400 and the call fails)")
-        if n > MAX_REF_FILE_BYTES:
-            raise ValueError(f"{p}: {n} bytes exceeds the {MAX_REF_FILE_BYTES} byte per-image limit")
-        with pp.open("rb") as f:
-            head = f.read(16)
-        ext = detect_image_ext(head)
-        if ext not in ALLOWED_REF_EXTS:
-            raise ValueError(f"{p}: unsupported or unrecognized image format (expected PNG, JPEG, WebP or GIF)")
-        total += n
-        out.append(str(pp))
-    if total > MAX_REF_TOTAL_BYTES:
-        raise ValueError(f"reference images total {total} bytes, over the {MAX_REF_TOTAL_BYTES} limit")
+    for idx, p in enumerate(paths):
+        pp, fd, n = _open_validated_regular(p, forbidden_inodes=forbidden_inodes)
+        try:
+            with os.fdopen(fd, "rb") as f:
+                fd = -1
+                if n > MAX_REF_FILE_BYTES:
+                    raise ValueError(f"{p}: {n} bytes exceeds the {MAX_REF_FILE_BYTES} byte per-image limit")
+                if n > MAX_REF_TOTAL_BYTES - total:
+                    raise ValueError(f"reference images total {total + n} bytes, over the {MAX_REF_TOTAL_BYTES} limit")
+                head = f.read(16)
+                ext = detect_image_ext(head)
+                if ext not in ALLOWED_REF_EXTS:
+                    raise ValueError(f"{p}: unsupported or unrecognized image format (expected PNG, JPEG, WebP or GIF)")
+                if stage_dir is not None:
+                    cap = min(MAX_REF_FILE_BYTES, MAX_REF_TOTAL_BYTES - total)
+                    dest, actual = _copy_bounded_to_stage(f, stage_dir, idx, pp.name, cap, str(p))
+                    total += actual
+                    out.append(str(dest))
+                else:
+                    total += n
+                    out.append(str(pp))
+        finally:
+            if fd >= 0:
+                os.close(fd)
     return out
+
+
+def check_ref_images(paths, max_count: int | None = None):
+    """Validates --ref files: regular non-empty files (no symlinks), within size cap, and real image magic bytes."""
+    return _validate_ref_images_impl(paths, max_count=max_count)
+
+
+def _collect_forbidden_inodes(cookies_file: str | None) -> set[tuple[int, int]]:
+    """Collects (st_dev, st_ino) for cookies files so openat/fstat validation blocks uploading them even under symlink races."""
+    inodes: set[tuple[int, int]] = set()
+    candidates = [default_cookies_file()]
+    if cookies_file:
+        candidates.append(Path(cookies_file))
+    for cand in candidates:
+        try:
+            st = cand.stat()
+            inodes.add((st.st_dev, st.st_ino))
+        except OSError:
+            pass
+    return inodes
+
+
+@contextlib.contextmanager
+def _staged_attachments(paths, *, is_ref: bool = False, max_count: int | None = None, cookies_file: str | None = None):
+    """Validates and copies attachments directly from nofollow fds into a private 0700 per-run folder (mode 0600 files),
+    preserving original filenames for MIME detection while closing the TOCTOU window before gemini-webapi reads paths.
+    """
+    if not paths:
+        yield []
+        return
+    label = "--ref" if is_ref else "--files"
+    for p in paths:
+        _, abs_p = _reject_symlink_prefix(str(p))
+        _refuse_same_as_default_cookies(abs_p, label)
+        if cookies_file is not None:
+            check_not_same_file(abs_p, cookies_file, label, "--cookies-file")
+    forbidden = _collect_forbidden_inodes(cookies_file)
+    with tempfile.TemporaryDirectory(prefix="gw_files_") as td:
+        os.chmod(td, 0o700)
+        stage_dir = Path(td)
+        if is_ref:
+            staged = _validate_ref_images_impl(paths, max_count=max_count, stage_dir=stage_dir, forbidden_inodes=forbidden)
+        else:
+            staged = _validate_files_impl(paths, stage_dir=stage_dir, forbidden_inodes=forbidden)
+        yield staged
 
 
 def _reject_symlink_prefix(path_str: str) -> tuple[Path, Path]:
@@ -368,6 +601,7 @@ def validate_aspect(value: str) -> str:
 def _open_regular_nofollow(abs_p: Path) -> int:
     """Opens an absolute path without following symlinks at any directory or leaf component (uses openat/dir_fd on POSIX)."""
     nofollow = getattr(os, "O_NOFOLLOW", 0)
+    binary = getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_DIRECTORY") and os.open in getattr(os, "supports_dir_fd", set()) and abs_p.is_absolute():
         parts = abs_p.parts
         if len(parts) < 2:
@@ -378,10 +612,10 @@ def _open_regular_nofollow(abs_p: Path) -> int:
                 next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=dir_fd)
                 os.close(dir_fd)
                 dir_fd = next_fd
-            return os.open(parts[-1], os.O_RDONLY | nofollow, dir_fd=dir_fd)
+            return os.open(parts[-1], os.O_RDONLY | nofollow | binary, dir_fd=dir_fd)
         finally:
             os.close(dir_fd)
-    return os.open(abs_p, os.O_RDONLY | nofollow)
+    return os.open(abs_p, os.O_RDONLY | nofollow | binary)
 
 
 def read_prompt_file(path_str: str) -> str:
@@ -479,8 +713,8 @@ def validate_args(args) -> tuple[int, str]:
     if args.mode == "tasks":
         if not args.allow_actions and not getattr(args, "estimate", False):  # --estimate exits before anything is sent
             return 7, "a task can act on your connected apps and browser; pass --allow-actions only when the user asked for a Gemini Task"
-        if args.files or args.ref or args.output_dir or args.effort is not None:
-            return 2, "tasks takes no --files, --ref, --output-dir, or --effort; leave them out"
+        if args.ref or args.output_dir or args.effort is not None:
+            return 2, "tasks takes no --ref, --output-dir, or --effort; leave them out"
     if args.model is not None and not str(args.model).strip():
         return 2, "--model must not be empty"
     cookies_file = getattr(args, "cookies_file", None)
@@ -506,8 +740,8 @@ def validate_args(args) -> tuple[int, str]:
         if args.output_dir:
             return 2, "--output-dir is only for image and video modes; use --output for chat"
     if args.mode == "research":
-        if args.files or args.ref or args.output_dir or args.effort not in (None, "high"):
-            return 2, "research takes no --files, --ref, --output-dir, or --effort; leave them out"
+        if args.ref or args.output_dir or args.effort not in (None, "high"):
+            return 2, "research takes no --ref, --output-dir, or --effort; leave them out"
     if args.mode in ("image", "video"):
         if args.files:
             return 2, f"{args.mode} mode uses --ref for reference images, not --files"
@@ -1315,6 +1549,61 @@ def _response_videos(r, cand) -> list:
         return []
 
 
+def _gex_tuple(gex, *names: str) -> tuple[type[BaseException], ...]:
+    """Extracts existing exception classes from gex (safe with partial test doubles)."""
+    out = []
+    for name in names:
+        exc = getattr(gex, name, None)
+        if isinstance(exc, type) and issubclass(exc, BaseException):
+            out.append(exc)
+    return tuple(out)
+
+
+async def _run_deep_research(c, gex, prompt: str, resolved_model, timeout: float, files: list[str] | None = None):
+    """Runs a Deep Research cycle. Delegates to c.deep_research when no files are attached; when files are given,
+    sends the plan turn with files via chat.send_message(deep_research=True) because c.deep_research lacks a files arg.
+    """
+    if not files:
+        return await c.deep_research(prompt, model=resolved_model, timeout=timeout)
+    deadline = time.time() + timeout
+    chat = c.start_chat(model=resolved_model)
+    definitive = _gex_tuple(gex, "UsageLimitExceededError", "TimeoutError", "ModelInvalidError", "TemporarilyBlockedError")
+    recoverable = _gex_tuple(gex, "GeminiError", "APIError")
+    gemini_err = getattr(gex, "GeminiError", RuntimeError)
+    recoverable_error = None
+    output = None
+    try:
+        output = await chat.send_message(prompt, files=files, deep_research=True)
+    except definitive:
+        raise
+    except recoverable as e:
+        recoverable_error = e
+    if (output is None or not (getattr(output, "deep_research_plan", None) or (getattr(output, "text", None) or "").strip())) and getattr(chat, "cid", None):
+        fallback = await c.fetch_latest_chat_response(chat.cid)
+        if fallback:
+            chat.last_output = fallback
+            output = fallback
+    if output is None or not (getattr(output, "deep_research_plan", None) or (getattr(output, "text", None) or "").strip()):
+        if recoverable_error is not None:
+            raise recoverable_error
+        raise gemini_err(f"Gemini returned no usable output for deep research. chat.cid={getattr(chat, 'cid', None)!r}")
+    plan = getattr(output, "deep_research_plan", None)
+    if not plan:
+        preview = (getattr(output, "text", None) or "").strip()[:300]
+        raise gemini_err(f"Gemini did not return a deep research plan. Preview: {preview!r}")
+    plan.metadata = list(getattr(chat, "metadata", None) or [])
+    plan.cid = getattr(chat, "cid", None) or getattr(plan, "cid", None)
+    if not getattr(plan, "confirm_prompt", None):
+        plan.confirm_prompt = "Start research"
+    if not getattr(plan, "response_text", None):
+        plan.response_text = getattr(output, "text", None) or ""
+    start_output = await c.start_deep_research(plan, chat=chat)
+    remaining = max(1.0, deadline - time.time())
+    result = await c.wait_for_deep_research(plan, timeout=remaining)
+    result.start_output = start_output
+    return result
+
+
 async def one_call(c, gex, args, prompt, files, resolved_model, out_dir: Path | None = None):
     """One generate call. Returns a dict with status, text, saved paths, detail, err_kind, thoughts, cid, label, note, u0, u1, dur."""
     PATCH["raw"].clear(); PATCH["applied"] = False
@@ -1327,12 +1616,15 @@ async def one_call(c, gex, args, prompt, files, resolved_model, out_dir: Path | 
     created_dirs: list[Path] = []
     try:
         if args.mode == "research":
-            res = await asyncio.wait_for(c.deep_research(prompt, model=resolved_model, timeout=args.timeout), args.timeout + 60)
+            res = await asyncio.wait_for(
+                _run_deep_research(c, gex, prompt, resolved_model, args.timeout, files=files or None),
+                args.timeout + 60,
+            )
             text = (res.text or "").strip()
             if not res.done:
                 status, text = "timeout", ""
             out = res.final_output or res.start_output
-            cid = ((getattr(out, "metadata", None) or [None])[0]) if out else None
+            cid = ((getattr(out, "metadata", None) or [None])[0]) if out else getattr(getattr(res, "plan", None), "cid", None)
         elif args.mode == "image":
             r = await asyncio.wait_for(
                 c.generate_content(prompt, files=files or None, model=resolved_model, temporary=not args.keep, extended_thinking=False),
@@ -1658,9 +1950,132 @@ def selftest():
         (t / "a.txt").write_text("x"); (t / "e.txt").write_text(""); (t / "big.txt").write_bytes(b"x" * (MAX_FILES_BYTES + 1))
         (t / "l.txt").symlink_to(t / "a.txt"); (t / "real").mkdir(); (t / "real" / "n.txt").write_text("n"); (t / "viapai").symlink_to(t / "real")
         check(check_files([t / "a.txt"]) == [str(t / "a.txt")], "regular file accepted")
-        for bad, what in ((t / "e.txt", "empty"), (t / "l.txt", "symlink"), (t, "folder"), (t / "big.txt", "too big"), (t / "viapai" / "n.txt", "symlinked parent folder")):
+        for bad, what in (
+            (t / "e.txt", "empty"),
+            (t / "l.txt", "symlink"),
+            (t, "folder"),
+            (t / "big.txt", "too big plain text"),
+            (t / "viapai" / "n.txt", "symlinked parent folder"),
+            (t / "viapai" / ".." / "a.txt", "symlink + .. bypass in check_files"),
+        ):
             try: check_files([bad]); check(False, f"{what} refused")
             except ValueError: ok += 1
+        # Rich/binary attachment classification and tiered caps (300 KB text vs 10 MB/file, 20 MB total for binary)
+        check(detect_binary_attachment_kind(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8) == "image", "binary kind: PNG")
+        check(detect_binary_attachment_kind(b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00") == "image", "binary kind: HEIC")
+        check(detect_binary_attachment_kind(b"\x00\x00\x00\x18ftypheif\x00\x00\x00\x00") == "image", "binary kind: HEIF")
+        check(detect_binary_attachment_kind(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3") == "pdf", "binary kind: PDF")
+        check(detect_binary_attachment_kind(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00") == "video", "binary kind: MP4")
+        check(detect_binary_attachment_kind(b"RIFF\x24\x00\x00\x00WAVEfmt ") == "audio", "binary kind: WAV")
+        check(detect_binary_attachment_kind(b"OggS\x00\x02\x00\x00") == "audio", "binary kind: OGG")
+        check(detect_binary_attachment_kind(b"fLaC\x00\x00\x00\x22") == "audio", "binary kind: FLAC")
+        check(detect_binary_attachment_kind(b"ID3\x03\x00\x00\x00\x00\x00\x10") == "audio", "binary kind: ID3v2 MP3")
+        check(detect_binary_attachment_kind(b"\xff\xfb\x90\x00") == "audio", "binary kind: raw MP3 sync")
+        check(detect_binary_attachment_kind(b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00") == "audio", "binary kind: M4A")
+        check(detect_binary_attachment_kind(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1\x00\x00") == "document", "binary kind: OLE2 doc")
+        check(detect_binary_attachment_kind(b"PK\x03\x04\x14\x00\x00\x00") is None, "PK prefix without real ZIP structure is not document")
+        check(detect_binary_attachment_kind(b"ID3 tags explained in plain text") is None, "plain text starting with ID3 is not audio")
+        check(detect_binary_attachment_kind(b"OggS plain text") is None, "plain text starting with OggS is not audio")
+        check(detect_binary_attachment_kind(b"plain text") is None, "plain text stays on text cap")
+        check(detect_binary_attachment_kind("Hello world".encode("utf-16")[:16]) is None, "UTF-16LE BOM is not misclassified as raw MP3 audio")
+        check(detect_binary_attachment_kind(b"\x00\x00\x00\x18ftypiso4\x00\x00\x00\x00") == "video", "binary kind: iso4 MP4")
+        check(detect_binary_attachment_kind(b"\x00\x00\x00\x18ftyp3gp4\x00\x00\x00\x00") == "video", "binary kind: 3gp4 video")
+        utf16_big = t / "utf16_big.txt"; utf16_big.write_bytes(("Hello world\n" * 20_000).encode("utf-16"))
+        try: check_files([utf16_big]); check(False, "UTF-16LE text over 300 KB refused")
+        except ValueError: ok += 1
+        # Real ZIP documents (OOXML .docm, renamed OOXML .bin, ODF .odt, EPUB) vs fake PK-prefixed .docx and generic .zip
+        def _write_zip(dest: Path, entries: dict[str, bytes], pad_size: int = 0) -> Path:
+            with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_STORED) as zf:
+                for k, v in entries.items():
+                    zf.writestr(k, v)
+                if pad_size > 0:
+                    zf.writestr("word/media/pad.bin" if any(k.startswith("word/") for k in entries) else "pad.bin", b"\x00" * pad_size)
+            return dest
+        real_docm = _write_zip(t / "macro.docm", {"[Content_Types].xml": b"<Types/>", "word/document.xml": b"<w:document/>"}, pad_size=MAX_FILES_BYTES + 20_000)
+        renamed_docx = _write_zip(t / "renamed_ooxml.bin", {"[Content_Types].xml": b"<Types/>", "xl/workbook.xml": b"<workbook/>"}, pad_size=MAX_FILES_BYTES + 20_000)
+        real_epub = _write_zip(t / "book.epub", {"mimetype": b"application/epub+zip", "content.opf": b"<package/>"}, pad_size=MAX_FILES_BYTES + 20_000)
+        real_odt = _write_zip(t / "doc.odt", {"mimetype": b"application/vnd.oasis.opendocument.text"}, pad_size=MAX_FILES_BYTES + 20_000)
+        generic_zip = _write_zip(t / "logs.docx", {"server.log": b"line\n" * 100}, pad_size=MAX_FILES_BYTES + 20_000)
+        fake_pk_docx = t / "fake_pk.docx"; fake_pk_docx.write_bytes(b"PK\x03\x04" + b"x" * (MAX_FILES_BYTES + 20_000))
+        check(check_files([real_docm, renamed_docx, real_epub, real_odt]) == [str(real_docm), str(renamed_docx), str(real_epub), str(real_odt)],
+              "real OOXML (.docm and renamed .bin), EPUB and ODT over 300 KB accepted by ZIP structure")
+        for bad_zip, what in ((fake_pk_docx, "PK-prefixed text named .docx"), (generic_zip, "plain ZIP renamed .docx")):
+            try: check_files([bad_zip]); check(False, f"{what} refused")
+            except ValueError: ok += 1
+        big_png = t / "big_img.png"; big_png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * (MAX_FILES_BYTES + 50_000))
+        big_pdf = t / "big_doc.pdf"; big_pdf.write_bytes(b"%PDF-1.4\n" + b"0" * (MAX_FILES_BYTES + 50_000))
+        fake_pdf = t / "fake.pdf"; fake_pdf.write_bytes(b"not a pdf " * (MAX_FILES_BYTES // 9))
+        check(check_files([big_png, big_pdf, t / "a.txt"]) == [str(big_png), str(big_pdf), str(t / "a.txt")],
+              "real PNG and PDF over 300 KB accepted alongside plain text")
+        try: check_files([fake_pdf]); check(False, "fake .pdf over 300 KB refused")
+        except ValueError: ok += 1
+        over_bin = t / "over_bin.pdf"
+        with over_bin.open("wb") as f:
+            f.write(b"%PDF-1.4\n")
+            f.truncate(MAX_BINARY_FILE_BYTES + 1)
+        try: check_files([over_bin]); check(False, "binary file over 10 MB per-file cap refused")
+        except ValueError: ok += 1
+        near_bin = t / "near_bin.pdf"
+        with near_bin.open("wb") as f:
+            f.write(b"%PDF-1.4\n")
+            f.truncate(MAX_BINARY_FILE_BYTES)
+        check(check_files([near_bin, near_bin]) == [str(near_bin), str(near_bin)], "20 MB exact total binary accepted")
+        try: check_files([near_bin, near_bin, t / "a.txt"]); check(False, "total over 20 MB refused")
+        except ValueError: ok += 1
+        try: check_files([big_png, t / "big.txt"]); check(False, "oversized text refused even alongside valid image")
+        except ValueError: ok += 1
+        # TOCTOU-safe staging: copies validated bytes from nofollow fd into 0700 dir (0600 file), survives post-stage symlink swap, wipes on exit
+        swap_target = t / "secret_target.txt"; swap_target.write_text("SECRET_NEVER_UPLOAD")
+        stage_src = t / "safe_note.txt"; stage_src.write_text("CLEAN_CONTENT")
+        with _staged_attachments([stage_src]) as staged:
+            staged_p = Path(staged[0])
+            stage_root = staged_p.parent.parent
+            stage_src.unlink(); stage_src.symlink_to(swap_target)
+            check(staged_p.name == "safe_note.txt" and staged_p.read_text() == "CLEAN_CONTENT"
+                  and (staged_p.stat().st_mode & 0o777) == 0o600 and (stage_root.stat().st_mode & 0o777) == 0o700,
+                  "staged attachment keeps original filename, private 0600/0700 perms, and is immune to post-stage symlink swap")
+        check(not stage_root.exists(), "staged attachment temp dir is wiped on exit")
+        # Staging --ref images, bounded-copy growth guard, and cookies / hardlink inode refusal
+        ref_src = t / "stage_ref.png"; ref_src.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x01" * 24)
+        with _staged_attachments([ref_src], is_ref=True, max_count=1) as staged_refs:
+            rp = Path(staged_refs[0]); ref_root = rp.parent.parent
+            check(rp.name == "stage_ref.png" and rp.read_bytes() == ref_src.read_bytes(), "staged --ref PNG preserves bytes and name")
+        check(not ref_root.exists(), "staged --ref temp dir is wiped on exit")
+        grow_dir = base / "grow_stage"; grow_dir.mkdir(mode=0o700)
+        try:
+            _copy_bounded_to_stage(io.BytesIO(b"abcdefghij"), grow_dir, 0, "grew.txt", 5, "grew.txt")
+            check(False, "bounded stage copy refuses stream exceeding limit")
+        except ValueError as e:
+            check("grew past" in str(e) and not (grow_dir / "0" / "grew.txt").exists(), "bounded stage copy removes partial file on growth")
+        ck_tmp = t / "stage_ck.json"; ck_tmp.write_text('{"__Secure-1PSID": "tok"}', encoding="utf-8"); os.chmod(ck_tmp, 0o600)
+        try:
+            with _staged_attachments([ck_tmp], cookies_file=str(ck_tmp)):
+                check(False, "staging refuses explicit cookies_file")
+        except ValueError:
+            ok += 1
+        ck_hl = t / "stage_ck_hl.json"
+        try:
+            os.link(ck_tmp, ck_hl)
+            try:
+                _validate_files_impl([ck_hl], forbidden_inodes=_collect_forbidden_inodes(str(ck_tmp)))
+                check(False, "forbidden_inodes blocks hard link to cookies file")
+            except ValueError:
+                ok += 1
+        except OSError:
+            ok += 1  # filesystems without hard links
+        prev_xdg_st = os.environ.get("XDG_DATA_HOME")
+        try:
+            st_xdg = base / "st_xdg"; (st_xdg / "gemini-web").mkdir(parents=True, mode=0o700)
+            def_ck = st_xdg / "gemini-web" / "cookies.json"; def_ck.write_text('{"__Secure-1PSID": "tok"}'); os.chmod(def_ck, 0o600)
+            os.environ["XDG_DATA_HOME"] = str(st_xdg)
+            try:
+                with _staged_attachments([def_ck]):
+                    check(False, "staging refuses default cookies.json")
+            except ValueError:
+                ok += 1
+        finally:
+            if prev_xdg_st is None: os.environ.pop("XDG_DATA_HOME", None)
+            else: os.environ["XDG_DATA_HOME"] = prev_xdg_st
         # Media helpers: magic bytes, predictable naming, ref validation, output-dir and output-file validation, arg validation
         check(detect_image_ext(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR") == ".png", "PNG magic bytes")
         check(detect_image_ext(b"\xff\xd8\xff\xe0\x00\x10JFIF") == ".jpg", "JPEG magic bytes")
@@ -1764,9 +2179,125 @@ def selftest():
         check(validate_args(ns(mode="chat", prompt="", prompt_file="p.txt"))[0] == 2, "empty --prompt with --prompt-file still refused")
         check(validate_args(ns(mode="chat", prompt_file="   "))[0] == 2, "blank --prompt-file refused")
         check(validate_args(ns(mode="tasks"))[0] == 7 and validate_args(ns(mode="tasks", allow_actions=True))[0] == 0, "tasks guards")
+        check(validate_args(ns(mode="tasks", allow_actions=True, files=["a.txt"]))[0] == 0, "tasks accepts --files")
+        check(validate_args(ns(mode="research", files=["a.pdf"]))[0] == 0, "research accepts --files")
         check(all(validate_args(ns(mode="tasks", allow_actions=True, **kw))[0] == 2 for kw in
-                  ({"files": ["a"]}, {"ref": ["a"]}, {"output_dir": "d"}, {"effort": "low"})), "tasks refuses untested options")
+                  ({"ref": ["a"]}, {"output_dir": "d"}, {"effort": "low"})), "tasks refuses unsupported options")
+        check(all(validate_args(ns(mode="research", **kw))[0] == 2 for kw in
+                  ({"ref": ["a"]}, {"output_dir": "d"}, {"effort": "low"})), "research refuses unsupported options")
         check(validate_args(ns(mode="tasks", estimate=True))[0] == 0, "a task estimate needs no --allow-actions")
+        # _run_deep_research: no files delegates to c.deep_research; with files uses chat.send_message(files=..., deep_research=True)
+        dr_log = []
+        class _FakeDRChat:
+            def __init__(self): self.cid = "c_dr1"; self.metadata = ["c_dr1", "r_1"]; self.last_output = None
+            async def send_message(self, prompt, files=None, deep_research=False):
+                dr_log.append(("send", prompt, list(files or []), deep_research))
+                plan = argparse.Namespace(metadata=[], cid=None, confirm_prompt="", response_text="")
+                return argparse.Namespace(deep_research_plan=plan, text="Here is the plan.")
+        class _FakeDRClient:
+            async def deep_research(self, prompt, model=None, timeout=600):
+                dr_log.append(("direct", prompt, model, timeout))
+                return argparse.Namespace(text="direct report", done=True, final_output=argparse.Namespace(metadata=["c_dir"]), start_output=None)
+            def start_chat(self, model=None):
+                dr_log.append(("start_chat", model))
+                return _FakeDRChat()
+            async def start_deep_research(self, plan, chat=None):
+                dr_log.append(("start", plan.cid, plan.confirm_prompt))
+                return argparse.Namespace(metadata=[plan.cid])
+            async def wait_for_deep_research(self, plan, timeout=600):
+                dr_log.append(("wait", plan.cid, timeout))
+                return argparse.Namespace(text="file report", done=True, final_output=argparse.Namespace(metadata=[plan.cid]), start_output=None, plan=plan)
+        dr_gex = argparse.Namespace(UsageLimitExceededError=KeyError, TimeoutError=KeyError, GeminiError=RuntimeError, APIError=RuntimeError)
+        dr_r0 = asyncio.run(_run_deep_research(_FakeDRClient(), dr_gex, "topic", "m", 120, files=None))
+        check(dr_r0.text == "direct report" and dr_log == [("direct", "topic", "m", 120)], "research without files delegates to c.deep_research")
+        dr_log.clear()
+        dr_r1 = asyncio.run(_run_deep_research(_FakeDRClient(), dr_gex, "topic", "m", 120, files=["note.txt"]))
+        check(dr_r1.text == "file report" and len(dr_log) == 4 and dr_log[:3] == [
+            ("start_chat", "m"), ("send", "topic", ["note.txt"], True), ("start", "c_dr1", "Start research"),
+        ] and dr_log[3][0] == "wait" and dr_log[3][1] == "c_dr1" and 1.0 <= dr_log[3][2] <= 120.0,
+              "research with files sends plan turn with files then starts and waits with remaining deadline")
+        # Recovery fallback when send_message raises recoverable APIError after turn landed server-side
+        class _FakeDRRecoverChat(_FakeDRChat):
+            async def send_message(self, prompt, files=None, deep_research=False):
+                raise RuntimeError("transient drop")
+        class _FakeDRRecoverClient(_FakeDRClient):
+            def start_chat(self, model=None): return _FakeDRRecoverChat()
+            async def fetch_latest_chat_response(self, cid):
+                plan = argparse.Namespace(metadata=[], cid=cid, confirm_prompt="Go", response_text="")
+                return argparse.Namespace(deep_research_plan=plan, text="Recovered plan.")
+        dr_log.clear()
+        dr_r2 = asyncio.run(_run_deep_research(_FakeDRRecoverClient(), dr_gex, "topic", "m", 90, files=["note.txt"]))
+        check(dr_r2.text == "file report" and len(dr_log) == 2 and dr_log[0] == ("start", "c_dr1", "Go")
+              and dr_log[1][0] == "wait" and dr_log[1][1] == "c_dr1" and 1.0 <= dr_log[1][2] <= 90.0,
+              "research with files recovers plan via fetch_latest_chat_response on recoverable error")
+        # Recovery fallback when send_message returns empty output (no plan and no text, no exception)
+        class _FakeDREmptyChat(_FakeDRChat):
+            async def send_message(self, prompt, files=None, deep_research=False):
+                return argparse.Namespace(deep_research_plan=None, text="")
+        class _FakeDREmptyClient(_FakeDRRecoverClient):
+            def start_chat(self, model=None): return _FakeDREmptyChat()
+        dr_log.clear()
+        dr_r3 = asyncio.run(_run_deep_research(_FakeDREmptyClient(), dr_gex, "topic", "m", 90, files=["note.txt"]))
+        check(dr_r3.text == "file report" and len(dr_log) == 2 and dr_log[0] == ("start", "c_dr1", "Go"),
+              "research with files recovers via fetch_latest_chat_response when send_message returns empty output")
+        # Definitive errors must re-raise directly without calling fetch_latest_chat_response; start/wait errors and done=False handled cleanly
+        class _DRLimitErr(Exception): pass
+        class _DRTimeoutErr(Exception): pass
+        class _DRModelErr(Exception): pass
+        class _DRBlockedErr(Exception): pass
+        class _DRBaseErr(Exception): pass
+        dr_full_gex = argparse.Namespace(
+            UsageLimitExceededError=_DRLimitErr, TimeoutError=_DRTimeoutErr,
+            ModelInvalidError=_DRModelErr, TemporarilyBlockedError=_DRBlockedErr,
+            GeminiError=_DRBaseErr, APIError=_DRBaseErr, AuthError=PermissionError,
+        )
+        for exc_cls, label_exc in (
+            (_DRLimitErr, "UsageLimitExceededError"),
+            (_DRTimeoutErr, "TimeoutError"),
+            (_DRModelErr, "ModelInvalidError"),
+            (_DRBlockedErr, "TemporarilyBlockedError"),
+        ):
+            fetched = []
+            class _DefinitiveChat(_FakeDRChat):
+                async def send_message(self, prompt, files=None, deep_research=False, _cls=exc_cls):
+                    raise _cls("definitive")
+            class _DefinitiveClient(_FakeDRClient):
+                def start_chat(self, model=None): return _DefinitiveChat()
+                async def fetch_latest_chat_response(self, cid):
+                    fetched.append(cid)
+                    return None
+            try:
+                asyncio.run(_run_deep_research(_DefinitiveClient(), dr_full_gex, "topic", "m", 60, files=["note.txt"]))
+                check(False, f"definitive {label_exc} re-raised")
+            except exc_cls:
+                check(not fetched, f"definitive {label_exc} never triggers fetch_latest_chat_response")
+        # start_deep_research / wait_for_deep_research failure and done=False / asyncio.TimeoutError through one_call
+        class _DRStartFailClient(_FakeDRClient):
+            async def start_deep_research(self, plan, chat=None): raise RuntimeError("start boom")
+        class _DRWaitFailClient(_FakeDRClient):
+            async def wait_for_deep_research(self, plan, timeout=600): raise RuntimeError("wait boom")
+        class _DRTimeoutWaitClient(_FakeDRClient):
+            usage_info = {}
+            async def _fetch_quota(self): pass
+            async def _fetch_usage_info(self): pass
+            async def wait_for_deep_research(self, plan, timeout=600): raise asyncio.TimeoutError()
+        class _DRUnfinishedClient(_FakeDRClient):
+            usage_info = {}
+            async def _fetch_quota(self): pass
+            async def _fetch_usage_info(self): pass
+            async def wait_for_deep_research(self, plan, timeout=600):
+                return argparse.Namespace(text="partial", done=False, final_output=None, start_output=None, plan=plan)
+        for bad_c, what in ((_DRStartFailClient(), "start_deep_research error"), (_DRWaitFailClient(), "wait_for_deep_research error")):
+            try:
+                asyncio.run(_run_deep_research(bad_c, dr_full_gex, "topic", "m", 60, files=["note.txt"]))
+                check(False, f"{what} propagates")
+            except RuntimeError:
+                ok += 1
+        unfin_r = asyncio.run(one_call(_DRUnfinishedClient(), dr_full_gex, ns(mode="research", timeout=30), "topic", ["note.txt"], "m"))
+        check(unfin_r["status"] == "timeout" and unfin_r["text"] == "" and unfin_r["cid"] == "c_dr1",
+              "research with files reports timeout and preserves plan cid when wait returns done=False")
+        to_r = asyncio.run(one_call(_DRTimeoutWaitClient(), dr_full_gex, ns(mode="research", timeout=30), "topic", ["note.txt"], "m"))
+        check(to_r["status"] == "timeout", "research with files maps asyncio.TimeoutError to status=timeout")
         real_main, real_argv = {k: globals()[k] for k in ("run", "make_client", "_maybe_reexec_venv")}, sys.argv
         called, shown, code = [], io.StringIO(), None
         def must_not_send(*a, **k): called.append(1); raise SystemExit(99)
@@ -1781,6 +2312,20 @@ def selftest():
             globals().update(real_main)
             sys.argv = real_argv
         check(code == 0 and not called and "credits=49" in shown.getvalue(), "a task estimate sends nothing")
+        # A ValueError raised inside run() must propagate rather than turning into exit 2 (staging-only ValueError catch)
+        async def _run_raises_val(*a, **k): raise ValueError("post-send decode error")
+        real_main2, real_argv2 = {k: globals()[k] for k in ("run", "_maybe_reexec_venv")}, sys.argv
+        try:
+            globals().update(run=_run_raises_val, _maybe_reexec_venv=lambda **k: None)
+            sys.argv = ["gemini_web.py", "--mode", "chat", "--prompt", "hi"]
+            try:
+                main()
+                check(False, "ValueError from run() is not caught as exit 2")
+            except ValueError as e:
+                check("post-send decode error" in str(e), "ValueError from run() propagates instead of exiting 2")
+        finally:
+            globals().update(real_main2)
+            sys.argv = real_argv2
         req = lambda inner: {"f.req": json.dumps([None, json.dumps(inner)])}
         sent, applied = patch_task_request(req([None] * 81))
         check(applied and json.loads(json.loads(sent["f.req"])[1])[49] == TASK_MODE_ID, "tasks patch sets field 50")
@@ -2321,7 +2866,8 @@ def main():
                    help="thinking level for chat mode (default: high); low is Baixo, high is Alto")
     p.add_argument("--keep", action="store_true",
                    help="keep the conversation in web history (default: temporary for chat/image; video, research and tasks always persist)")
-    p.add_argument("--files", nargs="+", default=[], help="regular files to attach (chat only; empty files and links are refused)")
+    p.add_argument("--files", nargs="+", default=[],
+                   help="regular files to attach (chat/tasks/research; text <=300 KB total, rich/binary <=10 MB each and <=20 MB total; empty files and links are refused)")
     p.add_argument("--ref", nargs="+", default=[],
                    help="reference image files for image/video modes (regular non-empty PNG, JPEG, WebP or GIF only)")
     p.add_argument("--aspect", default=None,
@@ -2410,8 +2956,8 @@ def main():
                 check_distinct_output_and_prompt(out_file, args.prompt_file)
             if args.cookies_file is not None:
                 check_not_same_file(out_file, args.cookies_file, "--output", "--cookies-file")
-        if args.mode in ("image", "video"):
-            files = check_ref_images(args.ref, max_count=(1 if args.mode == "video" else None)) if args.ref else []
+        is_media = args.mode in ("image", "video")
+        if is_media:
             if args.output_dir:
                 out_dir = check_output_dir(args.output_dir)
                 _refuse_same_as_default_cookies(out_dir, "--output-dir")
@@ -2419,22 +2965,25 @@ def main():
                     check_not_same_file(out_dir, args.cookies_file, "--output-dir", "--cookies-file")
             else:
                 check_cwd_writable()
-        else:
-            files = check_files(args.files) if args.files else []
-            for f in files:
-                fp = Path(os.path.abspath(f))
-                _refuse_same_as_default_cookies(fp, "--files")
-                if args.cookies_file is not None:
-                    check_not_same_file(fp, args.cookies_file, "--files", "--cookies-file")
     except ValueError as e:
         print(f"gemini_web: {e}", file=sys.stderr); sys.exit(2)
-    if dry_run:
-        extra = f", aspect={args.aspect}" if args.aspect else ""
-        extra_out = f" aspect={args.aspect}" if args.aspect else ""
-        print(f"gemini_web: dry-run validated ({format_estimate(args.mode, args.model, args.effort)}, files={len(files)}{extra})", file=sys.stderr)
-        print(f"[dry-run] mode={args.mode} model={args.model} effort={args.effort} files={len(files)}{extra_out}")
-        sys.exit(0)
-    sys.exit(asyncio.run(run(args, prompt, files, out_dir=out_dir, out_file=out_file)))
+    raw_attachments = args.ref if is_media else args.files
+    max_ref = 1 if args.mode == "video" else None
+    with contextlib.ExitStack() as stack:
+        try:
+            staged_files = stack.enter_context(
+                _staged_attachments(raw_attachments, is_ref=is_media, max_count=max_ref, cookies_file=args.cookies_file)
+            )
+        except ValueError as e:
+            print(f"gemini_web: {e}", file=sys.stderr); sys.exit(2)
+        if dry_run:
+            extra = f", aspect={args.aspect}" if args.aspect else ""
+            extra_out = f" aspect={args.aspect}" if args.aspect else ""
+            print(f"gemini_web: dry-run validated ({format_estimate(args.mode, args.model, args.effort)}, files={len(staged_files)}{extra})", file=sys.stderr)
+            print(f"[dry-run] mode={args.mode} model={args.model} effort={args.effort} files={len(staged_files)}{extra_out}")
+            sys.exit(0)
+        rc = asyncio.run(run(args, prompt, staged_files, out_dir=out_dir, out_file=out_file))
+    sys.exit(rc)
 
 if __name__ == "__main__":
     main()
