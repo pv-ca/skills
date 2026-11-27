@@ -43,6 +43,8 @@ A draft needs only `SKILL.md`, and must not be linked from the top-level `README
 4. If the output changed in a way a user would see, regenerate `example.md` from a real run.
 5. Add a line under `## Unreleased` in `CHANGELOG.md`, with the eval result.
 
+`expert-plan` carries its own copy of the `expert` method (the nine lines, provenance, the verb and the field). When `expert` changes, decide whether `expert-plan` needs the same change, and say which in the `CHANGELOG.md` line.
+
 ## Publishing and retiring
 
 - Publish a draft: remove `metadata`, add the files a published skill has, link it from the README.

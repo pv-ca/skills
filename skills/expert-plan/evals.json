@@ -1,0 +1,46 @@
+{
+  "cases": [
+    {
+      "id": "first-round-tag-at-end",
+      "message": "I want to move our team's shared spreadsheets of customer orders into a small database. Plan it with me. /expert-plan",
+      "expect": "fires",
+      "judge": "Only a first round, in plain Markdown with no emoji. The session read orders-jan.csv without editing it and asks nothing the file already answers (format, columns); it may cite what it saw (two spellings of one customer, mixed dates, a blank total). Numbered questions, one decision each, each with a 'Changes the plan' line and a recommendation worded so yes accepts it, saying what it rests on. At least one question asks about something that already happened, and none recommends 'tell me the number'. No plan block yet.",
+      "files": {
+        "orders-jan.csv": "order_id,customer,order_date,total\n1001,Northwind,2026-01-03,420.00\n1002,Northwind Inc.,04/01/2026,180.00\n1003,Contoso,2026-01-05,\n"
+      }
+    },
+    {
+      "id": "first-round-pt-br",
+      "message": "/expert-plan quero planejar o lançamento de um curso online de fotografia para iniciantes",
+      "expect": "fires",
+      "judge": "The round is in Portuguese with the labels 'Muda o plano' and 'Recomendação' and no emoji; its questions are about this course launch (not generic); at least one asks about the user's past experience or about comparable launches (an outside view); every recommendation is a concrete value or choice that a 'sim' settles (none says 'me diga' or 'tell me the number'); no question adds a deliverable the user did not ask for."
+    },
+    {
+      "id": "last-round-premortem",
+      "message": "/expert-plan I want to move our team's shared spreadsheets of customer orders into a small database.\n\nYou already asked round 1 and I answered:\n1. Purpose: stop people overwriting each other and make orders queryable.\n2. Done: every order is in the database or listed as rejected with a reason, and a teammate spot-checks 20 orders.\n3. Untouched: the original sheets stay read-only as an archive.\n4. Fit: about 30,000 rows in Google Sheets, 4 people edit, nobody on the team runs servers, free tools only.\n5. Now vs later: only orders now; invoices maybe next year.\n\nGo on with the next round.",
+      "expect": "fires",
+      "judge": "Does not repeat questions 1 to 5 and does not write the plan. The round sketches the plan in two or three lines, then asks a premortem (the work is done and failed: every reason, including ones not usually said) and a kill criterion in a state-and-date form; other questions, if any, are ones the answers above opened (for example 4 editors with no server). Questions are numbered from 6 on."
+    },
+    {
+      "id": "confirmation-gate",
+      "message": "/expert-plan Plan the move of our order spreadsheets into a small database.\n\nAll rounds are done and these are settled: purpose, stop overwrites and make orders queryable; done, every order loaded or rejected with a reason and a teammate spot-checks 20; untouched, original sheets read-only; fit, 30,000 rows in Google Sheets, 4 editors, no server, free tools; later, invoices next year; premortem, the team keeps editing the sheets after the cutover; kill criterion, if two weeks after cutover more than one person still edits the sheets, stop and re-plan.\n\nyes to all",
+      "expect": "fires",
+      "judge": "Says it has what it needs and asks whether to write the plan; no fenced plan block yet and no new round of questions."
+    },
+    {
+      "id": "plan-from-rounds",
+      "files": {
+        "orders-jan.csv": "order_id,customer,order_date,total\n1001,Northwind,2026-01-03,420.00\n1002,Northwind Inc.,04/01/2026,180.00\n1003,Contoso,2026-01-05,\n"
+      },
+      "message": "/expert-plan Plan the move of our order spreadsheets into a small database. The rounds are done and I confirm: write the plan now.\n\nSettled: purpose, stop overwrites and make orders queryable; done, every order loaded or rejected with a reason and a teammate spot-checks 20; untouched, \"as planilhas originais ficam só leitura\"; fit, 4 editors, no server, free tools; later, invoices next year (do not build them now); premortem, the team keeps editing the sheets after the cutover; kill criterion, if two weeks after cutover more than one person still edits the sheets, stop and re-plan. I said there are about 30,000 rows; nobody counted.",
+      "expect": "fires",
+      "judge": "One fenced plan block: an opening paragraph with what the work is for, then Field and the nine lines as bold unnumbered labels, no other sections and no open questions. Done when states the end state, which may include the user's own acceptance standard (the 20-order spot-check); how it is checked (scripts, counts, who samples) is in External check. The CSV anomalies seen in orders-jan.csv are marked checked; the 30,000 rows is marked not checked; settled decisions carry no mark; the Portuguese decision is quoted verbatim. Likely failure uses the user's premortem and the kill criterion. Invoices stay out of scope. Written from the user ('I') to the executing session ('you'), never 'you told me' or 'the user said'. Then 2 to 4 bullets and a one-line offer to run it. Not checked lists the open assumptions riskiest first; the deferred decision (invoices) is named with when it gets decided; a tool or approach no settled answer supports is marked as a default with the answer that would change it."
+    },
+    {
+      "id": "question-about-planning",
+      "message": "What questions should a team ask before planning a database migration?",
+      "expect": "silent",
+      "judge": "A direct answer to the question; the skill is not called."
+    }
+  ]
+}
