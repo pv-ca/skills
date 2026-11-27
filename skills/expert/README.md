@@ -14,7 +14,7 @@ The session that runs the rewritten prompt acts on it without checking it again,
 
 Type `/expert` anywhere in the message, usually at the end. A message holding only `/expert` rewrites your previous request. Attached screenshots and files count as part of the task. The agent can also reach for it when you ask to make a prompt deeper or what an expert would do.
 
-Reach for it before work where doing the obvious thing well is not enough: a fix whose cause you have not confirmed, a decision with money or users behind it, research where the easy sources are summaries. To have a plan questioned rather than rewritten, use a grilling skill instead.
+Reach for it before work where doing the obvious thing well is not enough: a fix whose cause you have not confirmed, a decision with money or users behind it, research where the easy sources are summaries. To be asked about the open decisions before the plan is written, use [expert-plan](../expert-plan/) instead.
 
 ## Example
 

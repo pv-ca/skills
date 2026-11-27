@@ -1,0 +1,3 @@
+interface:
+  display_name: "Expert Plan"
+  short_description: "Answer rounds of questions, get a plan written to an expert's standard"

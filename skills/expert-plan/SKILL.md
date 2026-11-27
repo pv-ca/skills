@@ -13,8 +13,6 @@ description: >
   "grill me and then write the plan", "interview me before planning". NOT FOR:
   rewriting a prompt with no questions (use expert), or only stress-testing an
   idea with no plan at the end.
-metadata:
-  internal: true
 ---
 
 # Expert plan
@@ -193,7 +191,7 @@ Format a round like so, in plain Markdown with no emoji:
 
 <one or two sentences of context, if needed> <the question: one decision>
 
-*Changes the plan:* <if A, the plan does X; if B, it does Y>
+*How this changes the plan:* <if A, the plan does X; if B, it does Y>
 
 > **Recommended:** <your recommended answer>, because <what it rests on>
 
@@ -203,15 +201,14 @@ Format a round like so, in plain Markdown with no emoji:
 
 <context> <the question>
 
-*Changes the plan:* <...>
+*How this changes the plan:* <...>
 
 > **Recommended:** <...>, because <...>
 ```
 
 Word each question so "yes" accepts your recommended answer: never ask "Is
 there X?" while recommending "no X". Write the round, labels included, in the
-user's language (in Portuguese: *Muda o plano:* and **Recomendação:**).
-Number questions across rounds, so a later round continues from the last
+user's language. Number questions across rounds, so a later round continues from the last
 number and the user can answer "3: no, ..." without ambiguity. End each round
 with one line on how to answer (by number, or "yes to all", which accepts
 every recommendation, defaults included) and what the next turn does. Before
